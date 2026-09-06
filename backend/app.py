@@ -148,6 +148,28 @@ def pause():
     return {"transport": speaker.get_current_transport_info()}
 
 
+def skip_track(direction: str):
+    speaker = get_speaker()
+    try:
+        if direction == "next":
+            speaker.next()
+        else:
+            speaker.previous()
+    except soco.exceptions.SoCoUPnPException as exc:
+        raise HTTPException(status_code=409, detail="Sonos cannot skip in that direction from the current track.") from exc
+    return {"transport": speaker.get_current_transport_info(), "track": speaker.get_current_track_info()}
+
+
+@app.post("/tracks/next")
+def next_track():
+    return skip_track("next")
+
+
+@app.post("/tracks/previous")
+def previous_track():
+    return skip_track("previous")
+
+
 @app.get("/volume")
 def volume():
     speaker = get_speaker()

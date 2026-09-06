@@ -37,6 +37,7 @@ struct APIError: LocalizedError {
     var discs: [Disc] = []
     var currentDisc: String?
     var status: PlayerStatus?
+    var draggingAlbum = false
     var editingVolume = false
     var busy = false
     var connected = false
@@ -67,7 +68,7 @@ struct APIError: LocalizedError {
         return data
     }
     func refresh(library: Bool = false, silent: Bool = false) async {
-        guard !busy && !editingVolume else { return }
+        guard !busy && !editingVolume && !draggingAlbum else { return }
         busy = true
         defer { busy = false }
         do {
@@ -91,8 +92,9 @@ struct APIError: LocalizedError {
         currentDisc = result.current_disc_id
         staleQueue = false
     }
-    func action(_ path: String, method: String = "POST", query: [URLQueryItem] = [], success: String? = nil) async {
-        guard !busy else { return }
+    @discardableResult
+    func action(_ path: String, method: String = "POST", query: [URLQueryItem] = [], success: String? = nil) async -> Bool {
+        guard !busy else { return false }
         busy = true
         defer { busy = false }
         do {
@@ -100,12 +102,18 @@ struct APIError: LocalizedError {
             notice = success
             try await refreshPlayback()
             connected = true
-        } catch { self.error = error.localizedDescription }
+            return true
+        } catch { self.error = error.localizedDescription; return false }
     }
-    func load(_ album: Album) async {
+    func isLoaded(_ album: Album) -> Bool {
+        discs.contains { $0.album.compare(album.title, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame && ($0.artist ?? "").compare(album.artist ?? "", options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame }
+    }
+    @discardableResult
+    func load(_ album: Album) async -> Bool {
+        guard !isLoaded(album) else { return false }
         var query = [URLQueryItem(name: "title", value: album.title)]
         if let artist = album.artist, !artist.isEmpty { query.append(URLQueryItem(name: "artist", value: artist)) }
-        await action("/discs/load", query: query, success: "Loaded \(album.title)")
+        return await action("/discs/load", query: query, success: "Loaded \(album.title)")
     }
 }
 
@@ -119,6 +127,7 @@ struct APIError: LocalizedError {
 struct ContentView: View {
     @Bindable var player: Player
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var search = ""
     @State private var settings = false
     @State private var resync = false
@@ -126,6 +135,35 @@ struct ContentView: View {
         player.albums.filter { search.isEmpty || ($0.title + " " + ($0.artist ?? "")).localizedCaseInsensitiveContains(search) }
     }
     var body: some View {
+        Group {
+            if UIDevice.current.userInterfaceIdiom == .pad && sizeClass != .compact {
+                VintageChangerView(player: player, settings: { settings = true }, resync: { resync = true })
+            } else {
+                phoneTabs
+            }
+        }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if let notice = player.notice {
+                HStack { Text(notice).font(.caption); Spacer(); Button("Dismiss", systemImage: "xmark") { player.notice = nil }.labelStyle(.iconOnly) }.padding(10).background(.thinMaterial)
+            }
+        }
+        .task { await player.refresh(library: true) }
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(5)) } catch { return }
+                await player.refresh(silent: true)
+            }
+        }
+        .sheet(isPresented: $settings) { SettingsView(player: player) }
+        .alert("Couldn’t complete that", isPresented: Binding(get: { player.error != nil }, set: { if !$0 { player.error = nil } })) {
+            Button("OK") { player.error = nil }
+        } message: { Text(player.error ?? "") }
+        .confirmationDialog("Reset disc tracking?", isPresented: $resync, titleVisibility: .visible) {
+            Button("Forget loaded discs", role: .destructive) { Task { await player.action("/discs/resync") } }
+        } message: { Text("This forgets the tray’s disc assignments. It does not remove tracks from Sonos.") }
+    }
+    private var phoneTabs: some View {
         TabView {
             NavigationStack {
                 List {
@@ -139,15 +177,15 @@ struct ContentView: View {
                     Section("Albums · \(filtered.count)") {
                         ForEach(filtered) { album in
                             HStack(spacing: 14) {
-                                Artwork(path: album.album_art_uri)
+                                Artwork(path: album.album_art_uri).saturation(player.isLoaded(album) ? 0 : 1).opacity(player.isLoaded(album) ? 0.4 : 1)
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(album.title).font(.headline)
                                     Text(album.artist ?? "Unknown artist").font(.subheadline).foregroundStyle(.secondary)
                                 }
                                 Spacer()
                                 Button { Task { await player.load(album) } } label: {
-                                    Image(systemName: "plus.circle.fill").font(.title2)
-                                }.buttonStyle(.borderless).disabled(player.busy || player.staleQueue)
+                                    Image(systemName: player.isLoaded(album) ? "checkmark.circle.fill" : "plus.circle.fill").font(.title2)
+                                }.buttonStyle(.borderless).disabled(player.busy || player.staleQueue || player.isLoaded(album))
                                     .accessibilityLabel("Load \(album.title)")
                             }.padding(.vertical, 4)
                         }
@@ -207,26 +245,6 @@ struct ContentView: View {
                 }.padding(24).frame(maxWidth: .infinity).navigationTitle("Now playing").toolbar { connectionToolbar }
             }.tabItem { Label("Now playing", systemImage: "waveform") }
         }
-        .safeAreaInset(edge: .top, spacing: 0) {
-            if let notice = player.notice {
-                HStack { Text(notice).font(.caption); Spacer(); Button("Dismiss", systemImage: "xmark") { player.notice = nil }.labelStyle(.iconOnly) }.padding(10).background(.thinMaterial)
-            }
-        }
-        .task { await player.refresh(library: true) }
-        .task(id: scenePhase) {
-            guard scenePhase == .active else { return }
-            while !Task.isCancelled {
-                do { try await Task.sleep(for: .seconds(5)) } catch { return }
-                await player.refresh(silent: true)
-            }
-        }
-        .sheet(isPresented: $settings) { SettingsView(player: player) }
-        .alert("Couldn’t complete that", isPresented: Binding(get: { player.error != nil }, set: { if !$0 { player.error = nil } })) {
-            Button("OK") { player.error = nil }
-        } message: { Text(player.error ?? "") }
-        .confirmationDialog("Reset disc tracking?", isPresented: $resync, titleVisibility: .visible) {
-            Button("Forget loaded discs", role: .destructive) { Task { await player.action("/discs/resync") } }
-        } message: { Text("This forgets the tray’s disc assignments. It does not remove tracks from Sonos.") }
     }
     @ToolbarContentBuilder var connectionToolbar: some ToolbarContent {
         ToolbarItem(placement: .topBarLeading) {
@@ -263,6 +281,10 @@ struct PlaybackControls: View {
                     Label("Next disc", systemImage: "forward.end.fill")
                 }.disabled(player.busy || player.discs.isEmpty || player.staleQueue)
             }.labelStyle(.iconOnly).font(.title)
+            HStack(spacing: 32) {
+                Button("Previous track", systemImage: "backward.fill") { Task { await player.action("/tracks/previous") } }
+                Button("Next track", systemImage: "forward.fill") { Task { await player.action("/tracks/next") } }
+            }.font(.subheadline).disabled(player.busy || (player.status?.track["uri"] ?? "").isEmpty)
             VStack(spacing: 8) {
                 HStack {
                     Text("Garage volume").font(.subheadline)

@@ -64,6 +64,7 @@ Verify deployment using `/discs`, `/status`, and `/albums`. The container uses h
 | POST | `/discs/next` or `/discs/previous` | Move between discs with wraparound |
 | POST | `/play-album?title=...` | Append and play an album |
 | POST | `/play` or `/pause` | Resume or pause |
+| POST | `/tracks/next` or `/tracks/previous` | Native Sonos next/previous track |
 | GET | `/status` | Track, transport, queue size, volume, mute state |
 | GET / POST | `/volume` | Read volume; set using `?level=0` through `100` |
 | POST | `/discs/resync` | Forget disc assignments after external queue edits, keeping tracks |

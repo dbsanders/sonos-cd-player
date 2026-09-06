@@ -27,3 +27,20 @@ def test_controls(monkeypatch):
         assert speaker.volume==100
     assert client.post('/volume').status_code==422
     assert client.get('/volume').json()=={'volume':100,'muted':False}
+
+def test_track_navigation(monkeypatch):
+    speaker = Speaker()
+    calls = []
+    speaker.next = lambda: calls.append('next')
+    speaker.previous = lambda: calls.append('previous')
+    monkeypatch.setattr(app, 'get_speaker', lambda:speaker)
+    client = TestClient(app.app)
+    assert client.post('/tracks/next').status_code == 200
+    assert client.post('/tracks/previous').status_code == 200
+    assert calls == ['next','previous']
+    def unavailable():
+        raise app.soco.exceptions.SoCoUPnPException('Transition not available', '701', '')
+    speaker.next = unavailable
+    response = client.post('/tracks/next')
+    assert response.status_code == 409
+    assert 'cannot skip' in response.json()['detail']
