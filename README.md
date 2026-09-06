@@ -72,11 +72,14 @@ Disc positions are 1-based and inclusive. Existing tracks remain in the queue. E
 
 ## GitHub workflow
 
-Create a private GitHub repository named `sonos-cd-player`, without an initial README, license, or .gitignore. Then add its URL and push:
+Private repository: https://github.com/dbsanders/sonos-cd-player
+
+Clone on another machine:
 
 ```sh
-git remote add origin git@github.com:YOUR-USERNAME/sonos-cd-player.git
-git push -u origin main
+git clone git@github.com:dbsanders/sonos-cd-player.git
 ```
+
+The original checkout tracks `origin/main`. After reviewing and committing changes, publish them with `git push`. Pull updates with `git pull --ff-only`.
 
 Make future iOS and backend changes here and commit them together when appropriate. Open this repository's Xcode project for ongoing work. A compatibility link at `~/Development/SonosCDPlayer` points to the same iOS folder; it is not a second copy.
