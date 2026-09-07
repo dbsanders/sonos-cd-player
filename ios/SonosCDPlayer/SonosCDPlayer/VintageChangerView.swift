@@ -8,10 +8,21 @@ struct VintageChangerView: View {
     @Bindable var player: Player
     let settings: () -> Void
     let resync: () -> Void
+    private enum SearchField: Hashable { case library, sets }
+    @FocusState private var focusedSearch: SearchField?
     @State private var search = ""
+    @AppStorage("cdLibrarySort") private var librarySort: LibrarySort = .album
+    @State private var selectedAlbumID: String?
+    @State private var showingSets = false
+    @State private var setSearch = ""
+    @State private var selectedSetID: String?
+    @State private var deletingSet: CDSet?
+    @AppStorage("shuffleCDSets") private var shuffleSets = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var targeted = false
     @State private var draggedAlbum: Album?
+    @State private var draggedDisc: Disc?
+    @State private var libraryTargeted = false
     @State private var dragPoint: CGPoint = .zero
     @State private var dragSpace = AlbumDragSpace()
     @State private var operation: String?
@@ -19,9 +30,14 @@ struct VintageChangerView: View {
     @State private var ejecting = false
     @State private var motion = false
     private var motionAnimation: Animation { .easeInOut(duration: reduceMotion ? 0.15 : 0.7) }
-    private func loadAlbum(_ album: Album) {
-        guard operation == nil, !player.staleQueue, !player.isLoaded(album) else { return }
-        operation = "LOADING · " + album.title
+    private func selectAlbum(_ album: Album) {
+        guard operation == nil, !player.draggingAlbum else { return }
+        focusedSearch = nil
+        selectedAlbumID = album.id
+    }
+    private func loadAlbum(_ album: Album, play: Bool = false) {
+        guard operation == nil, !player.draggingAlbum, !player.staleQueue, play || !player.isLoaded(album) else { return }
+        operation = (play ? "PLAYING · " : "LOADING · ") + album.title
         Task { @MainActor in
             // A drop must not be lost just because a status request was in flight.
             player.draggingAlbum = true
@@ -29,20 +45,35 @@ struct VintageChangerView: View {
             while player.busy {
                 do { try await Task.sleep(for: .milliseconds(50)) } catch { return }
             }
-            let success = await player.load(album)
-            if success { await animateDisc(album, eject: false) }
+            let wasLoaded = player.isLoaded(album)
+            let success = await player.load(album, play: play)
+            if success && !wasLoaded { await animateDisc(album, eject: false) }
             operation = nil
         }
     }
     private func ejectDisc(_ disc: Disc) {
-        guard operation == nil, !player.busy else { return }
+        guard operation == nil, !player.staleQueue else { return }
         operation = "EJECTING · " + disc.album
-        let album = player.albums.first { $0.title == disc.album && $0.artist == disc.artist }
-            ?? Album(title: disc.album, artist: disc.artist, album_art_uri: nil, uri: nil)
+        let album = albumForDisc(disc)
         Task { @MainActor in
+            player.draggingAlbum = true
+            defer { player.draggingAlbum = false; operation = nil }
+            while player.busy {
+                do { try await Task.sleep(for: .milliseconds(50)) } catch { return }
+            }
+            guard !player.staleQueue, player.discs.contains(where: { $0.id == disc.id }) else { return }
             let success = await player.action("/discs/\(disc.id)", method: "DELETE")
             if success { await animateDisc(album, eject: true) }
             operation = nil
+        }
+    }
+    private func ejectAllDiscs() {
+        guard operation == nil, !player.busy, !player.draggingAlbum, !player.staleQueue, !player.discs.isEmpty else { return }
+        operation = "EJECTING ALL DISCS"
+        Task { @MainActor in
+            player.draggingAlbum = true
+            defer { player.draggingAlbum = false; operation = nil }
+            await player.action("/discs", method: "DELETE", success: "All discs ejected")
         }
     }
     @MainActor private func animateDisc(_ album: Album, eject: Bool) async {
@@ -56,7 +87,7 @@ struct VintageChangerView: View {
         motion = false
     }
     private var albums: [Album] {
-        player.albums.filter { search.isEmpty || ($0.title + " " + ($0.artist ?? "")).localizedCaseInsensitiveContains(search) }
+        player.albums.filter { search.isEmpty || ($0.title + " " + ($0.artist ?? "")).localizedCaseInsensitiveContains(search) }.sorted(by: librarySort.precedes)
     }
     var body: some View {
         GeometryReader { geometry in
@@ -71,17 +102,11 @@ struct VintageChangerView: View {
                 } else {
                     ScrollView {
                         VStack(spacing: 24) {
-                            machine.frame(height: 810)
+                            machine.frame(height: 760)
                             library.frame(height: 650)
                         }.padding(20)
                     }
                 }
-                HStack {
-                    Text("COMPACT DISC DIGITAL AUDIO")
-                    Spacer()
-                    Text("GARAGE  /  PERSONAL MUSIC SYSTEM")
-                }.font(.system(size: 9, weight: .semibold, design: .monospaced)).tracking(2)
-                    .foregroundStyle(.white.opacity(0.3)).padding(.horizontal, 30).padding(.bottom, 14)
             }
             .background(LinearGradient(colors: [Color(white: 0.17), Color(white: 0.075)], startPoint: .topLeading, endPoint: .bottomTrailing))
             .overlay(alignment: .topLeading) {
@@ -91,16 +116,18 @@ struct VintageChangerView: View {
                         .position(dragPoint).allowsHitTesting(false).accessibilityHidden(true)
                 }
             }
-            .background { AlbumCoordinateSurface(space: dragSpace, isPlayer: false).allowsHitTesting(false) }
-            .onDisappear { draggedAlbum = nil; targeted = false; player.draggingAlbum = false }
+            .background { AlbumCoordinateSurface(space: dragSpace, region: .canvas).allowsHitTesting(false) }
+            .onDisappear { clearDrag(); selectedAlbumID = nil }
+            .onChange(of: search) { _, _ in selectedAlbumID = nil }
+            .onChange(of: showingSets) { _, _ in focusedSearch = nil }
+            .scrollDismissesKeyboard(.interactively)
         }
     }
     private var header: some View {
         HStack(spacing: 16) {
-            Screw()
             VStack(alignment: .leading, spacing: 3) {
                 Text("STEREO").font(.system(size: 24, weight: .black, design: .rounded)).tracking(5)
-                Text("THE COMPACT DISC COLLECTION").font(.system(size: 9, weight: .medium, design: .monospaced)).tracking(2)
+                Text("GRAMMY'S COMPACT DISC COLLECTION").font(.system(size: 9, weight: .medium, design: .monospaced)).tracking(2)
             }
             Spacer()
             HStack(spacing: 8) {
@@ -110,59 +137,202 @@ struct VintageChangerView: View {
             }
             Button(action: settings) { Image(systemName: "gearshape").frame(width: 44, height: 44) }
                 .buttonStyle(HardwareButtonStyle()).accessibilityLabel("Connection settings")
-            Screw()
-        }.foregroundStyle(Color(white: 0.78)).padding(.horizontal, 24).padding(.vertical, 18)
-            .background(MetalSurface()).overlay(alignment: .bottom) { Rectangle().fill(.black.opacity(0.6)).frame(height: 2) }
+        }.foregroundStyle(Color(white: 0.78)).padding(.horizontal, 24).padding(.vertical, 12)
+            .background(Color(white: 0.12)).overlay(alignment: .bottom) { Rectangle().fill(.white.opacity(0.08)).frame(height: 1) }
+    }
+    private var dismissSearchKeyboard: some View {
+        Button("Done") { focusedSearch = nil }
+            .font(.subheadline.weight(.semibold)).foregroundStyle(amber)
+            .frame(minWidth: 44, minHeight: 44).fixedSize()
+            .accessibilityLabel("Done searching, hide keyboard")
     }
     private var library: some View {
         VStack(alignment: .leading, spacing: 16) {
-            HStack(alignment: .firstTextBaseline) {
-                Text("The collection").font(.system(size: 27, weight: .semibold, design: .serif))
+            HStack(spacing: 12) {
+                collectionTab("CD Library", icon: "square.stack", sets: false)
+                collectionTab("CD Sets", icon: "opticaldisc", sets: true)
+            }
+            if showingSets {
+                setCollection
+            } else {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("CD Library").font(.system(size: 27, weight: .semibold, design: .serif))
+                    Spacer()
+                    Text("\(albums.count) \(albums.count == 1 ? "ALBUM" : "ALBUMS")").font(.system(size: 10, design: .monospaced)).tracking(1).foregroundStyle(.white.opacity(0.45))
+                    Button { Task { await player.refresh(library: true) } } label: { Image(systemName: "arrow.clockwise").frame(width: 44, height: 44) }
+                        .buttonStyle(HardwareButtonStyle()).disabled(player.busy).accessibilityLabel("Refresh library")
+                }
+                HStack {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.white.opacity(0.4))
+                    TextField("Find an album or artist", text: $search).font(.subheadline).autocorrectionDisabled()
+                        .focused($focusedSearch, equals: .library)
+                        .submitLabel(.done).onSubmit { focusedSearch = nil }
+                    if !search.isEmpty { Button { search = "" } label: { Image(systemName: "xmark.circle.fill") }.accessibilityLabel("Clear search") }
+                    if focusedSearch == .library { dismissSearchKeyboard }
+                }.padding(13).background(.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 5))
+                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(.white.opacity(0.08)))
+                HStack {
+                    LibrarySortSelector(selection: $librarySort).disabled(player.draggingAlbum)
+                    Spacer()
+                }
+                ScrollView {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 18)], spacing: 22) {
+                        ForEach(albums) { album in
+                            VStack(spacing: 10) {
+                                Group {
+                                    if player.isLoaded(album) {
+                                        JewelCase(album: album).accessibilityElement(children: .ignore).saturation(0).opacity(0.35)
+                                            .overlay(alignment: .topTrailing) {
+                                                Label("LOADED", systemImage: "checkmark.circle.fill")
+                                                    .font(.system(size: 9, weight: .bold)).padding(7).background(.black.opacity(0.85), in: Capsule())
+                                            }
+                                            .contentShape(Rectangle())
+                                            .onTapGesture { selectAlbum(album) }
+                                            .accessibilityLabel("\(album.title), already loaded")
+                                    } else {
+                                        JewelCase(album: album)
+                                            .contentShape(Rectangle())
+                                            .accessibilityElement(children: .ignore)
+                                            .opacity(draggedAlbum?.id == album.id ? 0.25 : 1)
+                                            .overlay {
+                                                AlbumPanSurface(space: dragSpace, tapped: { selectAlbum(album) }) { point, overPlayer, ended, cancelled in
+                                                    handleDrag(album, point: point, overPlayer: overPlayer, ended: ended, cancelled: cancelled)
+                                                }.accessibilityHidden(true)
+                                            }
+                                            .accessibilityLabel("\(album.title) by \(album.artist ?? "unknown artist"). Drag to the player to load.")
+                                            .accessibilityAction(named: "Load into magazine") { loadAlbum(album) }
+                                    }
+                                }
+                                .accessibilityAddTraits(.isButton)
+                                .accessibilityAddTraits(selectedAlbumID == album.id ? .isSelected : [])
+                                .accessibilityHint("Select this CD to show the Play now button.")
+                                .accessibilityAction { selectAlbum(album) }
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: 5)
+                                        .stroke(selectedAlbumID == album.id ? amber : .clear, lineWidth: 2)
+                                        .allowsHitTesting(false)
+                                }
+                                .animation(.easeInOut(duration: 0.25), value: player.isLoaded(album))
+                                if selectedAlbumID == album.id {
+                                    Button { loadAlbum(album, play: true) } label: {
+                                        Label("Play now", systemImage: "play.fill")
+                                            .font(.system(size: 12, weight: .semibold))
+                                            .frame(maxWidth: .infinity).frame(minHeight: 44)
+                                    }.buttonStyle(HardwareButtonStyle())
+                                        .disabled(operation != nil || player.busy || player.draggingAlbum || player.staleQueue)
+                                        .accessibilityLabel("Play now, \(album.title)")
+                                }
+                            }
+
+                        }
+                    }.padding(3)
+                    if albums.isEmpty {
+                        ContentUnavailableView(search.isEmpty ? "Your collection awaits" : "No matching albums", systemImage: "opticaldisc", description: Text(search.isEmpty ? "Use refresh to connect to your library." : "Try another title or artist."))
+                    }
+                }
+                .contentShape(Rectangle())
+                .simultaneousGesture(TapGesture().onEnded { focusedSearch = nil })
+                Text(draggedDisc != nil ? "RELEASE OVER THE COLLECTION TO UNLOAD" : "TAP TO SELECT · DRAG TO LOAD OR UNLOAD").font(.system(size: 9, design: .monospaced)).tracking(1.3).foregroundStyle(.white.opacity(0.35))
+            }
+        }
+        .background { AlbumCoordinateSurface(space: dragSpace, region: .library).allowsHitTesting(false) }
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(libraryTargeted ? amber : .clear, lineWidth: 3))
+        .overlay(alignment: .top) {
+            if libraryTargeted {
+                Text("RELEASE TO UNLOAD DISC")
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .padding(12).frame(maxWidth: .infinity).background(amber).foregroundStyle(.black)
+                    .clipShape(RoundedRectangle(cornerRadius: 5)).padding(8).allowsHitTesting(false)
+            }
+        }
+    }
+    private func collectionTab(_ title: String, icon: String, sets: Bool) -> some View {
+        Button {
+            showingSets = sets
+            selectedAlbumID = nil
+            selectedSetID = nil
+        } label: {
+            Label(title, systemImage: icon).font(.system(size: 14, weight: .semibold))
+                .frame(maxWidth: .infinity).frame(minHeight: 44)
+        }.buttonStyle(HardwareButtonStyle())
+            .overlay(RoundedRectangle(cornerRadius: 4).stroke(showingSets == sets ? amber : .clear, lineWidth: 2))
+            .accessibilityAddTraits(showingSets == sets ? .isSelected : [])
+            .disabled(player.draggingAlbum)
+    }
+    private var filteredSets: [CDSet] {
+        player.cdSets.filter { setSearch.isEmpty || $0.name.localizedCaseInsensitiveContains(setSearch) }
+    }
+    private func setCover(_ cdSet: CDSet) -> Album {
+        let artwork = cdSet.albums.compactMap { entry in
+            player.albums.first {
+                $0.title.compare(entry.title, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame &&
+                ($0.artist ?? "").compare(entry.artist ?? "", options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame &&
+                $0.album_art_uri != nil
+            }?.album_art_uri
+        }.first
+        return Album(title: cdSet.name, artist: "\(cdSet.albums.count) CDs", album_art_uri: artwork, uri: nil)
+    }
+    private var setCollection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text("Saved CD Sets").font(.system(size: 27, weight: .semibold, design: .serif))
                 Spacer()
-                Text("\(albums.count) \(albums.count == 1 ? "ALBUM" : "ALBUMS")").font(.system(size: 10, design: .monospaced)).tracking(1).foregroundStyle(.white.opacity(0.45))
-                Button { Task { await player.refresh(library: true) } } label: { Image(systemName: "arrow.clockwise").frame(width: 44, height: 44) }
-                    .buttonStyle(HardwareButtonStyle()).disabled(player.busy).accessibilityLabel("Refresh library")
+                Button { Task { await player.refresh(library: true) } } label: {
+                    Image(systemName: "arrow.clockwise").frame(width: 44, height: 44)
+                }.buttonStyle(HardwareButtonStyle()).disabled(player.busy || player.draggingAlbum)
+                    .accessibilityLabel("Refresh CD Sets")
             }
             HStack {
                 Image(systemName: "magnifyingglass").foregroundStyle(.white.opacity(0.4))
-                TextField("Find an album or artist", text: $search).font(.subheadline).autocorrectionDisabled()
-                if !search.isEmpty { Button { search = "" } label: { Image(systemName: "xmark.circle.fill") }.accessibilityLabel("Clear search") }
+                TextField("Find a CD set", text: $setSearch).font(.subheadline).autocorrectionDisabled()
+                    .focused($focusedSearch, equals: .sets)
+                    .submitLabel(.done).onSubmit { focusedSearch = nil }
+                if !setSearch.isEmpty {
+                    Button { setSearch = "" } label: { Image(systemName: "xmark.circle.fill") }.accessibilityLabel("Clear set search")
+                }
+                if focusedSearch == .sets { dismissSearchKeyboard }
             }.padding(13).background(.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 5))
-                .overlay(RoundedRectangle(cornerRadius: 5).stroke(.white.opacity(0.08)))
             ScrollView {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 18)], spacing: 22) {
-                    ForEach(albums) { album in
-                        Group {
-                            if player.isLoaded(album) {
-                                JewelCase(album: album).accessibilityElement(children: .ignore).saturation(0).opacity(0.35)
-                                    .overlay(alignment: .topTrailing) {
-                                        Label("LOADED", systemImage: "checkmark.circle.fill")
-                                            .font(.system(size: 9, weight: .bold)).padding(7).background(.black.opacity(0.85), in: Capsule())
-                                    }
-                                    .accessibilityLabel("\(album.title), already loaded")
-                            } else {
-                                JewelCase(album: album)
-                                    .contentShape(Rectangle())
-                                    .accessibilityElement(children: .ignore)
-                                    .opacity(draggedAlbum?.id == album.id ? 0.25 : 1)
-                                    .overlay {
-                                        AlbumPanSurface(space: dragSpace) { point, overPlayer, ended, cancelled in
-                                            handleDrag(album, point: point, overPlayer: overPlayer, ended: ended, cancelled: cancelled)
-                                        }.accessibilityHidden(true)
-                                    }
-                                    .accessibilityLabel("\(album.title) by \(album.artist ?? "unknown artist"). Drag to the player to load.")
-                                    .accessibilityAction(named: "Load into magazine") { loadAlbum(album) }
-                            }
-                        }.animation(.easeInOut(duration: 0.25), value: player.isLoaded(album))
-
-                    }
+                    ForEach(filteredSets) { cdSet in setCard(cdSet) }
                 }.padding(3)
-                if albums.isEmpty {
-                    ContentUnavailableView(search.isEmpty ? "Your collection awaits" : "No matching albums", systemImage: "opticaldisc", description: Text(search.isEmpty ? "Use refresh to connect to your library." : "Try another title or artist."))
+                if filteredSets.isEmpty {
+                    ContentUnavailableView(!player.setsAvailable ? "CD Sets unavailable" : (setSearch.isEmpty ? "No saved CD sets" : "No matching sets"), systemImage: "opticaldisc",
+                        description: Text(!player.setsAvailable ? "Update the NAS backend to enable CD Sets." : (setSearch.isEmpty ? "Load some CDs, then choose Save CD Set on the player." : "Try another set name.")))
                 }
             }
-            Text("SLIDE A CASE SIDEWAYS, THEN RELEASE OVER THE PLAYER").font(.system(size: 9, design: .monospaced)).tracking(1.3).foregroundStyle(.white.opacity(0.35))
+            .contentShape(Rectangle())
+            .simultaneousGesture(TapGesture().onEnded { focusedSearch = nil })
+            Text("SELECT A SET, THEN PLAY NOW").font(.system(size: 9, design: .monospaced)).tracking(1.3).foregroundStyle(.white.opacity(0.35))
         }
+        .onChange(of: setSearch) { _, _ in selectedSetID = nil }
+        .confirmationDialog("Delete \(deletingSet?.name ?? "set")?", isPresented: Binding(get: { deletingSet != nil }, set: { if !$0 { deletingSet = nil } }), titleVisibility: .visible) {
+            Button("Delete this set", role: .destructive) {
+                if let cdSet = deletingSet { Task { await player.deleteSet(cdSet) } }
+                deletingSet = nil
+            }
+        } message: { Text("The loaded CDs and current playback will stay as they are.") }
+    }
+    private func setCard(_ cdSet: CDSet) -> some View {
+        VStack(spacing: 10) {
+            Button { focusedSearch = nil; selectedSetID = cdSet.id } label: { JewelCase(album: setCover(cdSet)) }
+                .buttonStyle(.plain)
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(selectedSetID == cdSet.id ? amber : .clear, lineWidth: 2))
+                .accessibilityLabel("\(cdSet.name), \(cdSet.albums.count) CDs")
+                .accessibilityHint("Select to show Play now and Delete this set.")
+                .accessibilityAddTraits(selectedSetID == cdSet.id ? .isSelected : [])
+            if selectedSetID == cdSet.id {
+                Text("Replaces all CDs in the player.").font(.caption).foregroundStyle(.secondary)
+                Button { Task { await player.playSet(cdSet, shuffle: shuffleSets) } } label: {
+                    Label("Play now", systemImage: "play.fill").font(.system(size: 12, weight: .semibold))
+                        .frame(maxWidth: .infinity).frame(minHeight: 44)
+                }.buttonStyle(HardwareButtonStyle()).accessibilityLabel("Play now, \(cdSet.name)")
+                Button(role: .destructive) { deletingSet = cdSet } label: {
+                    Label("Delete this set", systemImage: "trash").font(.system(size: 12, weight: .semibold))
+                        .frame(maxWidth: .infinity).frame(minHeight: 44)
+                }.buttonStyle(HardwareButtonStyle()).accessibilityLabel("Delete this set, \(cdSet.name)")
+            }
+        }.disabled(operation != nil || player.busy || player.draggingAlbum || !player.setsAvailable)
     }
     private var machine: some View {
         VStack(spacing: 0) {
@@ -174,10 +344,22 @@ struct VintageChangerView: View {
                         Text("MULTI DISC").font(.system(size: 9, weight: .medium, design: .monospaced)).tracking(1)
                     }.foregroundStyle(Color(white: 0.7))
                     display
+                    CDSetControls(player: player, showSetBrowser: false).tint(amber)
                     HStack {
-                        Text("DISC MAGAZINE").font(.system(size: 10, weight: .bold, design: .monospaced)).tracking(2)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("DISC MAGAZINE").font(.system(size: 10, weight: .bold, design: .monospaced)).tracking(2)
+                            Text("\(player.discs.count) LOADED").font(.system(size: 9, design: .monospaced)).foregroundStyle(amber)
+                        }
                         Spacer()
-                        Text("\(player.discs.count) LOADED").font(.system(size: 9, design: .monospaced)).foregroundStyle(amber)
+                        Button(action: ejectAllDiscs) {
+                            HStack(spacing: 6) {
+                                Text("EJECT ALL").font(.system(size: 9, weight: .bold, design: .monospaced))
+                                Image(systemName: "eject.fill").font(.caption).frame(width: 44)
+                            }.padding(.leading, 10).frame(minHeight: 44)
+                        }.buttonStyle(HardwareButtonStyle())
+                            .disabled(player.discs.isEmpty || player.busy || player.draggingAlbum || player.staleQueue)
+                            .accessibilityLabel("Eject all discs")
+                            .padding(.trailing, 10)
                     }.foregroundStyle(.white.opacity(0.5))
                     if player.staleQueue {
                         Text("The queue changed in Sonos. Reset the magazine assignments to continue.").font(.footnote).foregroundStyle(amber)
@@ -201,18 +383,13 @@ struct VintageChangerView: View {
                     }
                     }.frame(minHeight: 100)
                     VintageTransport(player: player)
-                }.padding(22)
-                HStack {
-                    Screw(); Spacer()
-                    HStack(spacing: 4) { ForEach(0..<18, id: \.self) { _ in Capsule().fill(.black.opacity(0.65)).frame(width: 3, height: 13) } }
-                    Spacer(); Screw()
-                }.padding(.horizontal, 16).padding(.bottom, 14)
-            }.background(MetalSurface())
+                }.padding(18)
+            }.background(Color(white: 0.12))
                 .clipShape(RoundedRectangle(cornerRadius: 10))
-                .overlay(RoundedRectangle(cornerRadius: 10).stroke(LinearGradient(colors: [.white.opacity(0.24), .black], startPoint: .top, endPoint: .bottom), lineWidth: 1))
-                .shadow(color: .black.opacity(0.6), radius: 12, x: 5, y: 12)
-                .padding(.bottom, 15)
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(.white.opacity(0.08), lineWidth: 1))
         }
+        .contentShape(Rectangle())
+        .simultaneousGesture(TapGesture().onEnded { focusedSearch = nil })
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(targeted ? amber : .clear, lineWidth: 3))
         .overlay(alignment: .top) {
             if targeted || operation != nil {
@@ -238,24 +415,50 @@ struct VintageChangerView: View {
         }
         .disabled(operation != nil)
         .background {
-            AlbumCoordinateSurface(space: dragSpace, isPlayer: true).allowsHitTesting(false)
+            AlbumCoordinateSurface(space: dragSpace, region: .player).allowsHitTesting(false)
         }
     }
     private func handleDrag(_ album: Album, point: CGPoint, overPlayer: Bool, ended: Bool, cancelled: Bool) {
         if ended {
             guard draggedAlbum?.id == album.id else { return }
             let accepted = !cancelled && overPlayer
-            draggedAlbum = nil
-            targeted = false
-            player.draggingAlbum = false
+            clearDrag()
             if accepted { loadAlbum(album) }
             return
         }
         guard operation == nil, !player.staleQueue, !player.isLoaded(album) else { return }
+        selectedAlbumID = nil
         draggedAlbum = album
         player.draggingAlbum = true
         dragPoint = point
         targeted = overPlayer
+    }
+
+    private func albumForDisc(_ disc: Disc) -> Album {
+        player.albums.first { $0.title == disc.album && $0.artist == disc.artist }
+            ?? Album(title: disc.album, artist: disc.artist, album_art_uri: nil, uri: nil)
+    }
+    private func clearDrag() {
+        draggedAlbum = nil
+        draggedDisc = nil
+        targeted = false
+        libraryTargeted = false
+        player.draggingAlbum = false
+    }
+    private func handleDiscDrag(_ disc: Disc, point: CGPoint, overLibrary: Bool, ended: Bool, cancelled: Bool) {
+        if ended {
+            guard draggedDisc?.id == disc.id else { return }
+            let accepted = !cancelled && overLibrary
+            clearDrag()
+            if accepted { ejectDisc(disc) }
+            return
+        }
+        guard operation == nil, !player.staleQueue, player.discs.contains(where: { $0.id == disc.id }) else { return }
+        draggedDisc = disc
+        draggedAlbum = albumForDisc(disc)
+        player.draggingAlbum = true
+        dragPoint = point
+        libraryTargeted = overLibrary
     }
 
     private var displayState: String {
@@ -301,9 +504,24 @@ struct VintageChangerView: View {
                             Text(disc.artist ?? "Unknown artist").font(.system(size: 10)).foregroundStyle(.white.opacity(0.4)).lineLimit(1)
                         }
                         Spacer(minLength: 0)
-                        Image(systemName: disc.id == player.currentDisc ? "speaker.wave.2.fill" : "play.fill").font(.caption).foregroundStyle(amber)
                     }.frame(minHeight: 44).contentShape(Rectangle())
-                }.buttonStyle(.plain).accessibilityLabel("Play disc \(number), \(disc.album)")
+                }.buttonStyle(.plain)
+                    .opacity(draggedDisc?.id == disc.id ? 0.25 : 1)
+                    .overlay {
+                        AlbumPanSurface(space: dragSpace, destination: .library, tapped: {
+                            guard operation == nil, !player.busy, !player.staleQueue else { return }
+                            Task { await player.action("/discs/\(disc.id)/play") }
+                        }) { point, overLibrary, ended, cancelled in
+                            handleDiscDrag(disc, point: point, overLibrary: overLibrary, ended: ended, cancelled: cancelled)
+                        }.accessibilityHidden(true)
+                    }
+                    .accessibilityLabel("Play disc \(number), \(disc.album)")
+                    .accessibilityHint("Drag sideways to the collection to unload.")
+                    .accessibilityAction(named: "Unload to collection") { ejectDisc(disc) }
+                Button { Task { await player.action("/discs/\(disc.id)/play") } } label: {
+                    Image(systemName: "play.fill").font(.caption).foregroundStyle(amber)
+                        .frame(width: 44, height: 44)
+                }.buttonStyle(HardwareButtonStyle()).accessibilityLabel("Play disc \(number), \(disc.album)")
                 Button { ejectDisc(disc) } label: {
                     Image(systemName: "eject.fill").font(.caption).frame(width: 44, height: 44)
                 }.buttonStyle(HardwareButtonStyle()).accessibilityLabel("Eject disc \(number), \(disc.album)")
@@ -327,7 +545,7 @@ private struct VintageTransport: View {
         VStack(spacing: 10) {
             HStack(spacing: 12) {
                 transportButton("Previous disc", icon: "backward.end.fill", path: "/discs/previous", disabled: player.discs.isEmpty || player.staleQueue)
-                transportButton(transport == "PLAYING" ? "Pause" : "Resume", icon: transport == "PLAYING" ? "pause.fill" : "play.fill", path: transport == "PLAYING" ? "/pause" : "/play", disabled: !["PLAYING", "PAUSED_PLAYBACK", "STOPPED"].contains(transport) || (player.status?.track["uri"] ?? "").isEmpty)
+                transportButton(transport == "PLAYING" ? "Pause" : "Play", icon: transport == "PLAYING" ? "pause.fill" : "play.fill", path: transport == "PLAYING" ? "/pause" : "/play", disabled: !["PLAYING", "PAUSED_PLAYBACK", "STOPPED"].contains(transport) || (player.status?.track["uri"] ?? "").isEmpty)
                 transportButton("Next disc", icon: "forward.end.fill", path: "/discs/next", disabled: player.discs.isEmpty || player.staleQueue)
             }
             HStack(spacing: 12) {
@@ -342,7 +560,7 @@ private struct VintageTransport: View {
                 }.frame(width: 54, height: 54).shadow(color: .black.opacity(0.7), radius: 3, y: 3).accessibilityHidden(true)
                 VStack(spacing: 4) {
                     HStack {
-                        Text("OUTPUT LEVEL").tracking(1.5)
+                        Text("VOLUME LEVEL").tracking(1.5)
                         Spacer()
                         Text(player.status?.volume == nil ? "—" : "\(Int(volume))\(player.status?.muted == true ? " · MUTED" : "")").foregroundStyle(amber)
                     }.font(.system(size: 9, weight: .medium, design: .monospaced))
@@ -405,23 +623,6 @@ private struct HardwareButtonStyle: ButtonStyle {
             .opacity(enabled ? 1 : 0.35).offset(y: configuration.isPressed ? 1 : 0)
     }
 }
-private struct Screw: View {
-    var body: some View {
-        ZStack { Circle().fill(LinearGradient(colors: [Color(white: 0.32), Color(white: 0.1)], startPoint: .topLeading, endPoint: .bottomTrailing)); Capsule().fill(.black.opacity(0.8)).frame(width: 7, height: 1).rotationEffect(.degrees(-35)) }
-            .frame(width: 12, height: 12).overlay(Circle().stroke(.black.opacity(0.7))).accessibilityHidden(true)
-    }
-}
-private struct MetalSurface: View {
-    var body: some View {
-        LinearGradient(colors: [Color(white: 0.27), Color(white: 0.19), Color(white: 0.23)], startPoint: .top, endPoint: .bottom)
-            .overlay { Canvas { context, size in
-                for y in stride(from: 0.0, to: size.height, by: 2) {
-                    var path = Path(); path.move(to: CGPoint(x: 0, y: y)); path.addLine(to: CGPoint(x: size.width, y: y))
-                    context.stroke(path, with: .color(.white.opacity(0.025)), lineWidth: 0.5)
-                }
-            }}
-    }
-}
 private struct ScanLines: View {
     var body: some View {
         Canvas { context, size in
@@ -447,14 +648,17 @@ private struct LoadingDisc: View {
 
 // Use live UIKit views for both the preview and target. SwiftUI global coordinates
 // need not match UIWindow coordinates in an iPad's safe areas or resized windows.
+private enum AlbumDragRegion { case canvas, player, library }
+
 private final class AlbumDragSpace {
     weak var canvas: UIView?
     weak var player: UIView?
+    weak var library: UIView?
 
-    func sample(_ recognizer: UIPanGestureRecognizer) -> (point: CGPoint, overPlayer: Bool) {
+    func sample(_ recognizer: UIPanGestureRecognizer, destination: AlbumDragRegion) -> (point: CGPoint, overTarget: Bool) {
         let point = recognizer.location(in: canvas)
         guard let sourceWindow = recognizer.view?.window,
-              let target = player, target.window === sourceWindow else {
+              let target = destination == .library ? library : player, target.window === sourceWindow else {
             return (point, false)
         }
         return (point, target.bounds.contains(recognizer.location(in: target)))
@@ -463,7 +667,7 @@ private final class AlbumDragSpace {
 
 private struct AlbumCoordinateSurface: UIViewRepresentable {
     let space: AlbumDragSpace
-    let isPlayer: Bool
+    let region: AlbumDragRegion
     func makeUIView(context: Context) -> UIView {
         let view = UIView()
         view.isUserInteractionEnabled = false
@@ -472,7 +676,11 @@ private struct AlbumCoordinateSurface: UIViewRepresentable {
     }
     func updateUIView(_ uiView: UIView, context: Context) { register(uiView) }
     private func register(_ view: UIView) {
-        if isPlayer { space.player = view } else { space.canvas = view }
+        switch region {
+        case .canvas: space.canvas = view
+        case .player: space.player = view
+        case .library: space.library = view
+        }
     }
 }
 
@@ -480,8 +688,10 @@ private struct AlbumCoordinateSurface: UIViewRepresentable {
 // Keep scrolling configuration stable while the recognizer owns the touch.
 private struct AlbumPanSurface: UIViewRepresentable {
     let space: AlbumDragSpace
+    var destination: AlbumDragRegion = .player
+    var tapped: (() -> Void)? = nil
     var changed: (CGPoint, Bool, Bool, Bool) -> Void
-    func makeCoordinator() -> Coordinator { Coordinator(space: space, changed: changed) }
+    func makeCoordinator() -> Coordinator { Coordinator(space: space, destination: destination, tapped: tapped, changed: changed) }
     func makeUIView(context: Context) -> UIView {
         let view = UIView()
         view.backgroundColor = .clear
@@ -489,27 +699,40 @@ private struct AlbumPanSurface: UIViewRepresentable {
         pan.delegate = context.coordinator
         pan.maximumNumberOfTouches = 1
         view.addGestureRecognizer(pan)
+        if tapped != nil {
+            let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tap))
+            tap.require(toFail: pan)
+            view.addGestureRecognizer(tap)
+        }
         return view
     }
-    func updateUIView(_ uiView: UIView, context: Context) { context.coordinator.changed = changed }
+    func updateUIView(_ uiView: UIView, context: Context) {
+        context.coordinator.changed = changed
+        context.coordinator.tapped = tapped
+    }
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
         let space: AlbumDragSpace
+        let destination: AlbumDragRegion
+        var tapped: (() -> Void)?
         var changed: (CGPoint, Bool, Bool, Bool) -> Void
-        init(space: AlbumDragSpace, changed: @escaping (CGPoint, Bool, Bool, Bool) -> Void) {
+        init(space: AlbumDragSpace, destination: AlbumDragRegion, tapped: (() -> Void)?, changed: @escaping (CGPoint, Bool, Bool, Bool) -> Void) {
             self.space = space
+            self.destination = destination
+            self.tapped = tapped
             self.changed = changed
         }
+        @objc func tap() { tapped?() }
         func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
             guard let pan = gestureRecognizer as? UIPanGestureRecognizer else { return false }
             let velocity = pan.velocity(in: pan.view)
             return abs(velocity.x) > abs(velocity.y)
         }
         @objc func pan(_ recognizer: UIPanGestureRecognizer) {
-            let sample = space.sample(recognizer)
+            let sample = space.sample(recognizer, destination: destination)
             switch recognizer.state {
-            case .began, .changed: changed(sample.point, sample.overPlayer, false, false)
-            case .ended: changed(sample.point, sample.overPlayer, true, false)
-            case .cancelled, .failed: changed(sample.point, sample.overPlayer, true, true)
+            case .began, .changed: changed(sample.point, sample.overTarget, false, false)
+            case .ended: changed(sample.point, sample.overTarget, true, false)
+            case .cancelled, .failed: changed(sample.point, sample.overTarget, true, true)
             default: break
             }
         }

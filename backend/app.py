@@ -1,11 +1,38 @@
+import os
+
 from fastapi import FastAPI, HTTPException, Query
 import soco
+from requests.exceptions import RequestException
 
 app = FastAPI(title="Sonos CD Player")
 
 
 def get_speaker():
-    return soco.SoCo("192.168.1.85")
+    return soco.SoCo(os.environ.get("SONOS_SPEAKER_IP", "192.168.1.85"))
+
+
+def prepare_playback(speaker):
+    """Join configured rooms only for an explicit music playback request."""
+    members = list(dict.fromkeys(ip.strip() for ip in
+        os.environ.get("SONOS_GROUP_MEMBERS", "").split(",") if ip.strip()))
+    if not members:
+        return
+    try:
+        if not speaker.is_coordinator:
+            raise HTTPException(409, "The configured main speaker must lead the Sonos group. "
+                                "In Sonos, ungroup it and select it first before adding other rooms.")
+        for ip in members:
+            if ip == speaker.ip_address:
+                continue
+            member = soco.SoCo(ip)
+            group = member.group
+            if group is None:
+                raise HTTPException(409, f"Speaker {ip} cannot be grouped independently.")
+            if group.coordinator.uid != speaker.uid:
+                member.join(speaker)
+    except (soco.exceptions.SoCoException, RequestException, OSError) as exc:
+        raise HTTPException(503, "Could not group the music speakers. Check that all configured "
+                            "rooms are online, then try Play again.") from exc
 
 @app.get("/")
 def root():
@@ -65,7 +92,7 @@ def albums():
     }
 
 from changer import Changer
-changer = Changer(get_speaker)
+changer = Changer(get_speaker, prepare_playback=prepare_playback)
 
 @app.post("/play-album")
 def play_album(title: str, artist: str | None = None):
@@ -79,6 +106,30 @@ def loaded_discs():
 @app.post("/discs/load")
 def load_disc(title: str, artist: str | None = None):
     return changer.load(title, artist)
+
+@app.get("/cd-sets")
+def cd_sets():
+    return changer.list_sets()
+
+@app.post("/cd-sets")
+def save_cd_set(name: str):
+    return changer.create_set(name)
+
+@app.put("/cd-sets/{set_id}")
+def overwrite_cd_set(set_id: str):
+    return changer.overwrite_set(set_id)
+
+@app.delete("/cd-sets/{set_id}")
+def delete_cd_set(set_id: str):
+    return changer.delete_set(set_id)
+
+@app.post("/cd-sets/{set_id}/play")
+def play_cd_set(set_id: str, shuffle: bool = False):
+    return changer.play_set(set_id, shuffle)
+
+@app.post("/discs/shuffle")
+def shuffle_discs():
+    return changer.shuffle_discs()
 
 @app.post("/discs/next")
 def next_disc():
@@ -96,6 +147,11 @@ def resync_discs():
 @app.post("/discs/{disc_id}/play")
 def play_disc(disc_id: str):
     return changer.play(disc_id)
+
+@app.delete("/discs")
+def eject_all_discs():
+    """Stop playback, clear the entire queue, and forget every loaded CD."""
+    return changer.eject_all()
 
 @app.delete("/discs/{disc_id}")
 @app.post("/discs/{disc_id}/eject")
@@ -133,13 +189,14 @@ def test_queue():
 
 @app.post("/play")
 def play():
-    speaker = get_speaker()
-
-    return {
-        "before": speaker.get_current_transport_info(),
-        "result": speaker.play(),
-        "after": speaker.get_current_transport_info(),
-    }
+    with changer.lock:
+        speaker = get_speaker()
+        prepare_playback(speaker)
+        return {
+            "before": speaker.get_current_transport_info(),
+            "result": speaker.play(),
+            "after": speaker.get_current_transport_info(),
+        }
 
 @app.post("/pause")
 def pause():

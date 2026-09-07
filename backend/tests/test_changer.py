@@ -18,11 +18,18 @@ class Speaker:
         self.position = 1
         self.music_library = self
         self.fail_add = False
+        self.events = []
+        self.play_mode = 'SHUFFLE'
+    def stop(self): self.events.append('stop')
+    def clear_queue(self):
+        self.events.append('clear')
+        self.items = []
     def get_queue(self, start=0, max_items=100):
         q = Queue(self.items[start:start+max_items])
         q.total_matches = len(self.items)
         return q
     def get_albums(self, search_term, **kwargs):
+        self.events.append('resolve')
         return [] if search_term == 'missing' else [NS(title=search_term, creator='artist')]
     def get_tracks_for_album(self, artist, album, full_album_art_uri=False):
         return [track(album + str(i)) for i in range(2)]
@@ -33,6 +40,7 @@ class Speaker:
     def remove_from_queue(self, index):
         self.items.pop(index)
     def play_from_queue(self, index):
+        self.events.append('play')
         self.position = index+1
     def get_current_track_info(self):
         return {'playlist_position': str(self.position)}
@@ -106,3 +114,53 @@ def test_http_endpoints(setup,monkeypatch):
     assert client.post('/discs/previous').status_code==200
     assert client.delete('/discs/'+a['id']).status_code==200
     assert client.post('/play-album',params={'title':'B'}).json()['status']=='playing'
+
+
+def test_eject_all_clears_entire_queue_once_and_persists(setup, monkeypatch):
+    s, c = setup
+    c.load('A'); c.load('B')
+    def unexpected_remove(index):
+        pytest.fail('Bulk eject must not remove individual tracks')
+    monkeypatch.setattr(s, 'remove_from_queue', unexpected_remove)
+    assert c.eject_all() == {'status': 'ejected', 'discs': []}
+    assert s.events.count('clear') == 1
+    assert s.events[-2:] == ['stop', 'clear']
+    assert s.items == []  # Includes the pre-existing, untracked queue entry.
+    restored = Changer(lambda: s, c.path)
+    assert restored.listing()['discs'] == []
+    assert restored.state['queue'] == []
+    assert c.load('C')['disc']['queue_start'] == 1
+
+
+@pytest.mark.parametrize('failure', ['before_clear', 'after_clear', 'not_empty'])
+def test_eject_all_failure_does_not_trust_disc_positions(setup, monkeypatch, failure):
+    s, c = setup
+    c.load('A')
+    def failed_clear():
+        if failure == 'not_empty':
+            return
+        if failure == 'after_clear':
+            s.items = []
+        raise RuntimeError('Connection lost')
+    monkeypatch.setattr(s, 'clear_queue', failed_clear)
+    with pytest.raises(HTTPException) as error:
+        c.eject_all()
+    assert error.value.status_code == 409
+    restored = Changer(lambda: s, c.path)
+    with pytest.raises(HTTPException):
+        restored.load('B')
+    restored.resync()
+    assert restored.listing()['discs'] == []
+
+
+def test_eject_all_endpoint(setup, monkeypatch):
+    s, c = setup
+    monkeypatch.setenv('CHANGER_STATE', str(c.path))
+    import app
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(app, 'changer', c)
+    c.load('A')
+    response = TestClient(app.app).delete('/discs')
+    assert response.status_code == 200
+    assert response.json()['discs'] == []
+    assert s.items == []

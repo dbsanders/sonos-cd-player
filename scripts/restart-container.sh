@@ -1,8 +1,15 @@
 #!/bin/sh
 set -eu
+# Synology's sudo environment may omit the Container Manager CLI directory.
+PATH="/usr/local/bin:/var/packages/ContainerManager/target/usr/bin:/var/packages/Docker/target/usr/bin:$PATH"
+export PATH
 cd /volume1/homes/nasadmin/sonos-cd-player
 if [ "$(id -u)" != 0 ]; then
   echo 'Run this script with sudo.' >&2
+  exit 1
+fi
+if ! command -v docker >/dev/null 2>&1; then
+  echo 'Docker was not found. Install and start Synology Container Manager (or Docker) before deploying.' >&2
   exit 1
 fi
 backup="sonos-cd-player-before-changer-$(date +%Y%m%d-%H%M%S)"
@@ -17,7 +24,9 @@ if ! docker run -d --name sonos-cd-player --network host --restart unless-stoppe
   exit 1
 fi
 attempt=0
-until curl -fsS http://localhost:8000/discs; do
+# Readiness must not fail merely because the user edited the Sonos queue or
+# interrupted a set load. Those conditions intentionally make /discs return 409.
+until curl -fsS http://localhost:8000/; do
   attempt=$((attempt + 1))
   if [ "$attempt" -ge 20 ]; then
     docker logs --tail 50 sonos-cd-player

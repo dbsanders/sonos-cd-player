@@ -7,6 +7,38 @@ struct Album: Decodable, Identifiable {
     let uri: String?
     var id: String { (uri ?? title) + (artist ?? "") }
 }
+enum LibrarySort: String, CaseIterable, Identifiable {
+    case artist, album
+    var id: String { rawValue }
+    var title: String { self == .artist ? "Artist" : "Album name" }
+    func precedes(_ lhs: Album, _ rhs: Album) -> Bool {
+        let leftArtist = lhs.artist?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rightArtist = rhs.artist?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let left = leftArtist.flatMap { $0.isEmpty ? nil : $0 } ?? "Unknown artist"
+        let right = rightArtist.flatMap { $0.isEmpty ? nil : $0 } ?? "Unknown artist"
+        let primary = (self == .artist ? left : lhs.title).localizedStandardCompare(self == .artist ? right : rhs.title)
+        if primary != .orderedSame { return primary == .orderedAscending }
+        let secondary = (self == .artist ? lhs.title : left).localizedStandardCompare(self == .artist ? rhs.title : right)
+        if secondary != .orderedSame { return secondary == .orderedAscending }
+        return lhs.id < rhs.id
+    }
+}
+
+struct LibrarySortSelector: View {
+    @Binding var selection: LibrarySort
+    var body: some View {
+        HStack {
+            Text("Sort by").font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+            Picker("Sort by", selection: $selection) {
+                ForEach(LibrarySort.allCases) { order in Text(order.title).tag(order) }
+            }.pickerStyle(.menu).tint(.orange)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+        }.fixedSize(horizontal: true, vertical: false)
+            .frame(minHeight: 44)
+    }
+}
+
 struct AlbumList: Decodable { let albums: [Album] }
 struct Disc: Decodable, Identifiable {
     let id: String
@@ -29,8 +61,16 @@ struct PlayerStatus: Decodable {
 }
 struct APIError: LocalizedError {
     let message: String
+    var statusCode: Int? = nil
     var errorDescription: String? { message }
 }
+struct CDSet: Decodable, Identifiable {
+    struct Entry: Decodable { let title: String; let artist: String? }
+    let id: String
+    let name: String
+    let albums: [Entry]
+}
+struct CDSetList: Decodable { let sets: [CDSet] }
 
 @MainActor @Observable final class Player {
     var albums: [Album] = []
@@ -44,26 +84,62 @@ struct APIError: LocalizedError {
     var error: String?
     var notice: String?
     var staleQueue = false
+    var cdSets: [CDSet] = []
+    var setsAvailable = false
+    var setOperation: String?
     var address = UserDefaults.standard.string(forKey: "server") ?? "http://192.168.1.100:8000"
+    private var libraryLoaded = false
+    private let session: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        // Give the first Local Network permission prompt time to complete.
+        configuration.waitsForConnectivity = true
+        configuration.timeoutIntervalForResource = 30
+        return URLSession(configuration: configuration)
+    }()
+    private let setSession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForResource = 300
+        return URLSession(configuration: configuration)
+    }()
 
-    func request(_ path: String, method: String = "GET", query: [URLQueryItem] = []) async throws -> Data {
+    func resetLibrary() {
+        albums = []
+        libraryLoaded = false
+    }
+
+    func request(_ path: String, method: String = "GET", query: [URLQueryItem] = [], longRunning: Bool = false) async throws -> Data {
         guard var url = URLComponents(string: address), ["http", "https"].contains(url.scheme ?? ""), url.host != nil else {
             throw APIError(message: "Enter a server address such as http://192.168.1.100:8000")
         }
         url.path = path
         url.queryItems = query.isEmpty ? nil : query
+        // URLComponents leaves literal + signs intact, but the backend decodes
+        // them as spaces in query parameters. Preserve album and artist names.
+        url.percentEncodedQuery = url.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
         guard let endpoint = url.url else { throw APIError(message: "Invalid server address") }
         var req = URLRequest(url: endpoint)
         req.httpMethod = method
-        req.timeoutInterval = 15
-        let (data, response) = try await URLSession.shared.data(for: req)
+        req.timeoutInterval = longRunning ? 300 : 15
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await (longRunning ? setSession : session).data(for: req)
+        } catch let networkError as URLError {
+            switch networkError.code {
+            case .notConnectedToInternet, .timedOut, .cannotConnectToHost, .cannotFindHost, .networkConnectionLost, .dataNotAllowed:
+                connected = false
+                throw APIError(message: "Could not reach \(address). Connect to the same Wi-Fi network as your NAS, then enable CD Player in Settings → Privacy & Security → Local Network. Check the backend address in Connection settings if it still won’t connect.")
+            default:
+                throw networkError
+            }
+        }
         guard let http = response as? HTTPURLResponse else { throw APIError(message: "No server response") }
         guard (200..<300).contains(http.statusCode) else {
             let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             let detail = body?["detail"]
             let message = (detail as? String) ?? "The server could not complete this action (\(http.statusCode))."
             if http.statusCode == 409 && message.contains("resync") { staleQueue = true }
-            throw APIError(message: message)
+            throw APIError(message: message, statusCode: http.statusCode)
         }
         return data
     }
@@ -72,15 +148,75 @@ struct APIError: LocalizedError {
         busy = true
         defer { busy = false }
         do {
-            if library {
+            try await refreshSets()
+            if library || !libraryLoaded {
                 let data = try await request("/albums")
                 albums = try JSONDecoder().decode(AlbumList.self, from: data).albums
+                libraryLoaded = true
             }
             try await refreshPlayback()
             connected = true
         } catch {
             connected = false
             if !silent { self.error = error.localizedDescription }
+        }
+    }
+    private func refreshSets() async throws {
+        do {
+            let data = try await request("/cd-sets")
+            cdSets = try JSONDecoder().decode(CDSetList.self, from: data).sets
+            setsAvailable = true
+        } catch let apiError as APIError where apiError.statusCode == 404 {
+            // Older backends remain usable while the CD Sets update is deployed.
+            setsAvailable = false
+            cdSets = []
+        }
+    }
+    func saveSet(name: String, replacing setID: String? = nil) async -> Bool {
+        guard !busy else { return false }
+        busy = true
+        defer { busy = false }
+        do {
+            if let setID {
+                _ = try await request("/cd-sets/\(setID)", method: "PUT")
+            } else {
+                _ = try await request("/cd-sets", method: "POST", query: [URLQueryItem(name: "name", value: name)])
+            }
+            try await refreshSets()
+            notice = "Saved \(name)"
+            return true
+        } catch { self.error = error.localizedDescription; return false }
+    }
+    func deleteSet(_ cdSet: CDSet) async {
+        guard !busy else { return }
+        busy = true
+        defer { busy = false }
+        do {
+            _ = try await request("/cd-sets/\(cdSet.id)", method: "DELETE")
+            try await refreshSets()
+        } catch { self.error = error.localizedDescription }
+    }
+    func playSet(_ cdSet: CDSet, shuffle: Bool) async {
+        await replaceCDs(path: "/cd-sets/\(cdSet.id)/play", query: [URLQueryItem(name: "shuffle", value: String(shuffle))], label: "Loading \(cdSet.name)…")
+    }
+    func shuffleCDs() async {
+        await replaceCDs(path: "/discs/shuffle", label: "Shuffling CDs…")
+    }
+    private func replaceCDs(path: String, query: [URLQueryItem] = [], label: String) async {
+        guard !busy && !draggingAlbum else { return }
+        busy = true
+        setOperation = label
+        discs = []; currentDisc = nil; status = nil
+        defer { busy = false; setOperation = nil }
+        do {
+            _ = try await request(path, method: "POST", query: query, longRunning: true)
+            try await refreshPlayback()
+            connected = true
+            notice = "CDs loaded and playing"
+        } catch {
+            self.error = "\(error.localizedDescription) If loading was interrupted, refresh to check the queue before trying again."
+            // Recover the actual queue if only the response was lost.
+            try? await refreshPlayback()
         }
     }
     private func refreshPlayback() async throws {
@@ -105,15 +241,19 @@ struct APIError: LocalizedError {
             return true
         } catch { self.error = error.localizedDescription; return false }
     }
-    func isLoaded(_ album: Album) -> Bool {
-        discs.contains { $0.album.compare(album.title, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame && ($0.artist ?? "").compare(album.artist ?? "", options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame }
+    func isLoaded(_ album: Album) -> Bool { loadedDisc(for: album) != nil }
+    func loadedDisc(for album: Album) -> Disc? {
+        discs.first { $0.album.compare(album.title, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame && ($0.artist ?? "").compare(album.artist ?? "", options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame }
     }
     @discardableResult
-    func load(_ album: Album) async -> Bool {
-        guard !isLoaded(album) else { return false }
+    func load(_ album: Album, play: Bool = false) async -> Bool {
+        guard !staleQueue else { return false }
+        if let disc = loadedDisc(for: album) {
+            return play ? await action("/discs/\(disc.id)/play", success: "Playing \(album.title)") : false
+        }
         var query = [URLQueryItem(name: "title", value: album.title)]
         if let artist = album.artist, !artist.isEmpty { query.append(URLQueryItem(name: "artist", value: artist)) }
-        return await action("/discs/load", query: query, success: "Loaded \(album.title)")
+        return await action(play ? "/play-album" : "/discs/load", query: query, success: "\(play ? "Playing" : "Loaded") \(album.title)")
     }
 }
 
@@ -129,10 +269,11 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var search = ""
+    @AppStorage("cdLibrarySort") private var librarySort: LibrarySort = .album
     @State private var settings = false
     @State private var resync = false
     var filtered: [Album] {
-        player.albums.filter { search.isEmpty || ($0.title + " " + ($0.artist ?? "")).localizedCaseInsensitiveContains(search) }
+        player.albums.filter { search.isEmpty || ($0.title + " " + ($0.artist ?? "")).localizedCaseInsensitiveContains(search) }.sorted(by: librarySort.precedes)
     }
     var body: some View {
         Group {
@@ -140,11 +281,6 @@ struct ContentView: View {
                 VintageChangerView(player: player, settings: { settings = true }, resync: { resync = true })
             } else {
                 phoneTabs
-            }
-        }
-        .safeAreaInset(edge: .top, spacing: 0) {
-            if let notice = player.notice {
-                HStack { Text(notice).font(.caption); Spacer(); Button("Dismiss", systemImage: "xmark") { player.notice = nil }.labelStyle(.iconOnly) }.padding(10).background(.thinMaterial)
             }
         }
         .task { await player.refresh(library: true) }
@@ -174,6 +310,9 @@ struct ContentView: View {
                             Text("Load an album into the tray, then choose a disc to start listening.").foregroundStyle(.secondary)
                         }.padding(.vertical, 14)
                     }
+                    Section {
+                        LibrarySortSelector(selection: $librarySort).disabled(player.draggingAlbum)
+                    }
                     Section("Albums · \(filtered.count)") {
                         ForEach(filtered) { album in
                             HStack(spacing: 14) {
@@ -194,12 +333,14 @@ struct ContentView: View {
                         }
                     }
                 }.searchable(text: $search, prompt: "Album or artist")
+                    .scrollDismissesKeyboard(.interactively)
                     .navigationTitle("CD Player")
                     .toolbar { connectionToolbar }
                     .refreshable { await player.refresh(library: true) }
             }.tabItem { Label("Library", systemImage: "square.stack") }
             NavigationStack {
                 List {
+                    Section { CDSetControls(player: player) }
                     if player.staleQueue {
                         Section {
                             Text("The Sonos queue changed. Reset disc tracking to use the tray again. Your queued music will stay in place.")
@@ -347,12 +488,108 @@ struct SettingsView: View {
                         Button("Save") {
                             player.address = address.trimmingCharacters(in: .whitespacesAndNewlines)
                             UserDefaults.standard.set(player.address, forKey: "server")
-                            player.albums = []; player.discs = []; player.status = nil; player.connected = false
+                            player.resetLibrary(); player.discs = []; player.status = nil; player.connected = false
+                            player.cdSets = []; player.setsAvailable = false
                             dismiss()
                             Task { await player.refresh(library: true) }
                         }.disabled(player.busy)
                     }
                 }
         }.onAppear { address = player.address }
+    }
+}
+
+struct CDSetControls: View {
+    @Bindable var player: Player
+    var showSetBrowser = true
+    @AppStorage("shuffleCDSets") private var shuffle = false
+    @State private var saving = false
+    @State private var name = ""
+    @State private var replacingID = ""
+    @State private var deleting: CDSet?
+    private var selectedSet: CDSet? { player.cdSets.first { $0.id == replacingID } }
+    private var validSave: Bool {
+        !player.busy && !player.draggingAlbum && !player.staleQueue && !player.discs.isEmpty &&
+        (replacingID.isEmpty ? !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && name.count <= 80 : selectedSet != nil)
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Button {
+                    name = ""; replacingID = ""; saving = true
+                } label: {
+                    Label("Save CD Set", systemImage: "plus.circle").font(.headline).frame(minHeight: 44)
+                }.disabled(player.busy || player.draggingAlbum || !player.setsAvailable || player.discs.isEmpty || player.staleQueue)
+                Spacer()
+                Menu {
+                    Toggle("Shuffle CDs when loading", isOn: $shuffle)
+                    Button("Shuffle Loaded CDs & Play", systemImage: "shuffle") { Task { await player.shuffleCDs() } }
+                        .disabled(player.discs.count < 2 || player.staleQueue)
+                    if showSetBrowser {
+                        Section("Play a saved set") {
+                            ForEach(player.cdSets) { cdSet in
+                                Button(cdSet.name) { Task { await player.playSet(cdSet, shuffle: shuffle) } }
+                            }
+                        }
+                        Menu("Delete a set") {
+                            ForEach(player.cdSets) { cdSet in
+                                Button(cdSet.name, role: .destructive) { deleting = cdSet }
+                            }
+                        }.disabled(player.cdSets.isEmpty)
+                    }
+                } label: {
+                    Image(systemName: "shuffle").frame(width: 44, height: 44)
+                }.accessibilityLabel("CD playback options")
+                    .disabled(player.busy || player.draggingAlbum || !player.setsAvailable)
+                if player.setOperation != nil { ProgressView() }
+            }
+            if let operation = player.setOperation {
+                Text(operation).font(.caption).foregroundStyle(.secondary)
+            } else if !player.setsAvailable {
+                Text("Update the NAS backend to enable CD Sets.").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .confirmationDialog("Delete \(deleting?.name ?? "set")?", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }), titleVisibility: .visible) {
+            Button("Delete this set", role: .destructive) {
+                if let cdSet = deleting { Task { await player.deleteSet(cdSet) } }
+                deleting = nil
+            }
+        } message: { Text("The loaded CDs and current playback will stay as they are.") }
+        .sheet(isPresented: $saving) {
+            NavigationStack {
+                Form {
+                    Section("Save to") {
+                        Picker("CD Set", selection: $replacingID) {
+                            Text("Create a new set").tag("")
+                            ForEach(player.cdSets) { cdSet in Text(cdSet.name).tag(cdSet.id) }
+                        }
+                        if replacingID.isEmpty {
+                            TextField("New set name", text: $name)
+                        }
+                    }
+                    Section {
+                        Text(replacingID.isEmpty
+                            ? "Save the \(player.discs.count) loaded CDs in their current order."
+                            : "Replace the CDs saved in \(selectedSet?.name ?? "this set") with the \(player.discs.count) currently loaded CDs.")
+                        Text("Playback will continue.").foregroundStyle(.secondary)
+                    }
+                }.navigationTitle("Save CD Set")
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) { Button("Cancel") { saving = false } }
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button(replacingID.isEmpty ? "Save" : "Overwrite") {
+                                let savedName = selectedSet?.name ?? name.trimmingCharacters(in: .whitespacesAndNewlines)
+                                let savedID = replacingID.isEmpty ? nil : replacingID
+                                Task {
+                                    if await player.saveSet(name: savedName, replacing: savedID) { saving = false }
+                                }
+                            }.disabled(!validSave)
+                        }
+                    }
+            }.presentationDetents([.medium, .large])
+                .alert("Couldn’t save set", isPresented: Binding(get: { player.error != nil }, set: { if !$0 { player.error = nil } })) {
+                    Button("OK") { player.error = nil }
+                } message: { Text(player.error ?? "") }
+        }
     }
 }
