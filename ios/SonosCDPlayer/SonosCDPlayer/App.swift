@@ -73,6 +73,7 @@ struct CDSet: Decodable, Identifiable {
 struct CDSetList: Decodable { let sets: [CDSet] }
 
 @MainActor @Observable final class Player {
+    static let demoAddress = "https://not-streaming-demo.dbsand.chatgpt.site"
     var albums: [Album] = []
     var discs: [Disc] = []
     var currentDisc: String?
@@ -87,7 +88,9 @@ struct CDSetList: Decodable { let sets: [CDSet] }
     var cdSets: [CDSet] = []
     var setsAvailable = false
     var setOperation: String?
+    var demoMode = (UserDefaults.standard.object(forKey: "demoMode") as? Bool) ?? true
     var address = UserDefaults.standard.string(forKey: "server") ?? "http://192.168.1.100:8000"
+    var activeAddress: String { demoMode ? Self.demoAddress : address }
     private var libraryLoaded = false
     private let session: URLSession = {
         let configuration = URLSessionConfiguration.default
@@ -108,10 +111,10 @@ struct CDSetList: Decodable { let sets: [CDSet] }
     }
 
     func request(_ path: String, method: String = "GET", query: [URLQueryItem] = [], longRunning: Bool = false) async throws -> Data {
-        guard var url = URLComponents(string: address), ["http", "https"].contains(url.scheme ?? ""), url.host != nil else {
+        guard var url = URLComponents(string: activeAddress), ["http", "https"].contains(url.scheme ?? ""), url.host != nil else {
             throw APIError(message: "Enter a server address such as http://192.168.1.100:8000")
         }
-        url.path = path
+        url.path = (demoMode ? "/api" : "") + path
         url.queryItems = query.isEmpty ? nil : query
         // URLComponents leaves literal + signs intact, but the backend decodes
         // them as spaces in query parameters. Preserve album and artist names.
@@ -128,7 +131,10 @@ struct CDSetList: Decodable { let sets: [CDSet] }
             switch networkError.code {
             case .notConnectedToInternet, .timedOut, .cannotConnectToHost, .cannotFindHost, .networkConnectionLost, .dataNotAllowed:
                 connected = false
-                throw APIError(message: "Could not reach \(address). Connect to the same Wi-Fi network as your NAS, then enable CD Player in Settings → Privacy & Security → Local Network. Check the backend address in Connection settings if it still won’t connect.")
+                if demoMode {
+                    throw APIError(message: "Could not reach the demonstration service. Check your internet connection and try again.")
+                }
+                throw APIError(message: "Could not reach \(address). Connect to the same Wi-Fi network as your NAS, then enable Not Streaming in Settings → Privacy & Security → Local Network. Check the backend address in Connection settings if it still won’t connect.")
             default:
                 throw networkError
             }
@@ -305,10 +311,23 @@ struct ContentView: View {
                 List {
                     Section {
                         VStack(alignment: .leading, spacing: 10) {
-                            Label("GARAGE", systemImage: "hifispeaker.fill").font(.caption.weight(.bold)).foregroundStyle(.orange)
+                            Label(player.demoMode ? "DEMO LIBRARY" : "GARAGE", systemImage: player.demoMode ? "sparkles" : "hifispeaker.fill")
+                                .font(.caption.weight(.bold)).foregroundStyle(.orange)
                             Text("Your collection.\nReady to play.").font(.largeTitle.bold())
                             Text("Load an album into the tray, then choose a disc to start listening.").foregroundStyle(.secondary)
                         }.padding(.vertical, 14)
+                    }
+                    if player.demoMode {
+                        Section {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Label("You’re exploring the demo", systemImage: "sparkles")
+                                    .font(.headline).foregroundStyle(.orange)
+                                Text("This is a fictional collection. Playback controls are simulated and no audio is sent anywhere.")
+                                    .font(.subheadline).foregroundStyle(.secondary)
+                                Button("Connect to your system") { settings = true }
+                                    .font(.subheadline.weight(.semibold))
+                            }.padding(.vertical, 4)
+                        }
                     }
                     Section {
                         LibrarySortSelector(selection: $librarySort).disabled(player.draggingAlbum)
@@ -334,7 +353,7 @@ struct ContentView: View {
                     }
                 }.searchable(text: $search, prompt: "Album or artist")
                     .scrollDismissesKeyboard(.interactively)
-                    .navigationTitle("CD Player")
+                    .navigationTitle("Not Streaming")
                     .toolbar { connectionToolbar }
                     .refreshable { await player.refresh(library: true) }
             }.tabItem { Label("Library", systemImage: "square.stack") }
@@ -377,7 +396,7 @@ struct ContentView: View {
                     Image(systemName: "opticaldisc.fill").font(.system(size: 120)).foregroundStyle(.orange.gradient)
                     VStack(spacing: 8) {
                         Text(player.status?.track["title"].flatMap { $0.isEmpty ? nil : $0 } ?? "Nothing playing").font(.title.bold()).multilineTextAlignment(.center)
-                        Text(player.status?.track["artist"] ?? "Garage").foregroundStyle(.secondary)
+                        Text(player.status?.track["artist"] ?? (player.demoMode ? "Demo player" : "Garage")).foregroundStyle(.secondary)
                         Text(player.status?.track["album"] ?? "").font(.subheadline).foregroundStyle(.secondary)
                     }
                     Text(player.status?.transport["current_transport_state"]?.replacingOccurrences(of: "_", with: " ").capitalized ?? "Not connected").font(.caption.weight(.semibold)).foregroundStyle(.orange)
@@ -391,7 +410,7 @@ struct ContentView: View {
         ToolbarItem(placement: .topBarLeading) {
             HStack(spacing: 5) {
                 Circle().fill(player.connected ? Color.green : Color.gray).frame(width: 6, height: 6)
-                Text(player.connected ? "Garage" : "Offline").font(.caption).fixedSize()
+                Text(player.demoMode ? "Demo" : (player.connected ? "Garage" : "Offline")).font(.caption).fixedSize()
                 if player.busy { ProgressView().controlSize(.mini) }
             }
         }
@@ -428,7 +447,7 @@ struct PlaybackControls: View {
             }.font(.subheadline).disabled(player.busy || (player.status?.track["uri"] ?? "").isEmpty)
             VStack(spacing: 8) {
                 HStack {
-                    Text("Garage volume").font(.subheadline)
+                    Text("\(player.demoMode ? "Sonos Speaker" : "Garage") volume").font(.subheadline)
                     Spacer()
                     Text(player.status?.muted == true ? "Muted · \(Int(volume))%" : "\(Int(volume))%")
                         .font(.subheadline.monospacedDigit()).foregroundStyle(.secondary)
@@ -444,7 +463,7 @@ struct PlaybackControls: View {
                                 volume = Double(player.status?.volume ?? level)
                             }
                         }
-                    }.accessibilityLabel("Garage volume").accessibilityValue("\(Int(volume)) percent")
+                    }.accessibilityLabel("\(player.demoMode ? "Sonos Speaker" : "Garage") volume").accessibilityValue("\(Int(volume)) percent")
                     Image(systemName: "speaker.wave.3.fill").foregroundStyle(.secondary)
                 }.disabled(player.busy || player.status?.volume == nil)
                 if player.status?.volume == nil {
@@ -473,21 +492,36 @@ struct Artwork: View {
 struct SettingsView: View {
     let player: Player
     @State private var address = ""
+    @State private var demoMode = false
     @Environment(\.dismiss) private var dismiss
     var body: some View {
         NavigationStack {
             Form {
                 Section("Backend address") {
-                    TextField("http://192.168.1.100:8000", text: $address).keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
+                    Toggle("Demo", isOn: $demoMode)
+                    TextField("http://192.168.1.100:8000", text: $address)
+                        .keyboardType(.URL)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .disabled(demoMode)
+                    if demoMode {
+                        Text("Uses a fictional music library and simulated playback. Your backend address is preserved.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
                 }
-                Section { Text("Connect to the same local network as your NAS and Garage speaker. Allow Local Network access when iOS asks.") }
+                Section {
+                    Text(demoMode ? "Demo mode does not connect to your NAS or Sonos system." : "Connect to the same local network as your NAS and Garage speaker. Allow Local Network access when iOS asks.")
+                }
             }.navigationTitle("Connection")
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                     ToolbarItem(placement: .confirmationAction) {
                         Button("Save") {
                             player.address = address.trimmingCharacters(in: .whitespacesAndNewlines)
+                            player.demoMode = demoMode
                             UserDefaults.standard.set(player.address, forKey: "server")
+                            UserDefaults.standard.set(player.demoMode, forKey: "demoMode")
                             player.resetLibrary(); player.discs = []; player.status = nil; player.connected = false
                             player.cdSets = []; player.setsAvailable = false
                             dismiss()
@@ -495,7 +529,10 @@ struct SettingsView: View {
                         }.disabled(player.busy)
                     }
                 }
-        }.onAppear { address = player.address }
+        }.onAppear {
+            address = player.address
+            demoMode = player.demoMode
+        }
     }
 }
 

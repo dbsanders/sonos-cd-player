@@ -127,13 +127,15 @@ struct VintageChangerView: View {
         HStack(spacing: 16) {
             VStack(alignment: .leading, spacing: 3) {
                 Text("STEREO").font(.system(size: 24, weight: .black, design: .rounded)).tracking(5)
-                Text("GRAMMY'S COMPACT DISC COLLECTION").font(.system(size: 9, weight: .medium, design: .monospaced)).tracking(2)
+                Text(player.demoMode ? "FICTIONAL COMPACT DISC COLLECTION" : "GRAMMY'S COMPACT DISC COLLECTION")
+                    .font(.system(size: 9, weight: .medium, design: .monospaced)).tracking(2)
             }
             Spacer()
             HStack(spacing: 8) {
                 Circle().fill(player.connected ? amber : .gray).frame(width: 6, height: 6)
                     .shadow(color: player.connected ? amber.opacity(0.7) : .clear, radius: 5)
-                Text(player.connected ? "GARAGE CONNECTED" : "GARAGE OFFLINE").font(.system(size: 10, weight: .bold, design: .monospaced)).tracking(1)
+                Text(player.demoMode ? "DEMO · FICTIONAL LIBRARY" : (player.connected ? "GARAGE CONNECTED" : "GARAGE OFFLINE"))
+                    .font(.system(size: 10, weight: .bold, design: .monospaced)).tracking(1)
             }
             Button(action: settings) { Image(systemName: "gearshape").frame(width: 44, height: 44) }
                 .buttonStyle(HardwareButtonStyle()).accessibilityLabel("Connection settings")
@@ -574,7 +576,7 @@ private struct VintageTransport: View {
                             }
                         }
                     }.tint(amber).disabled(player.busy || player.status?.volume == nil)
-                        .accessibilityLabel("Garage volume").accessibilityValue("\(Int(volume)) percent")
+                        .accessibilityLabel("\(player.demoMode ? "Sonos Speaker" : "Garage") volume").accessibilityValue("\(Int(volume)) percent")
                 }.foregroundStyle(.white.opacity(0.5))
             }
         }.onAppear { volume = Double(player.status?.volume ?? 0) }
