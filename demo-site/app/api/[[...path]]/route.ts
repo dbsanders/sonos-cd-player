@@ -63,11 +63,11 @@ function selectedAlbum(state: DemoState) {
   return albums.find((album) => album.id === state.currentDiscId) ?? null;
 }
 
-function albumPayload(album: Album) {
+function albumPayload(album: Album, origin: string) {
   return {
     title: album.title,
     artist: album.artist,
-    album_art_uri: null,
+    album_art_uri: `${origin}/covers/${album.id}.jpg`,
     uri: `demo:album:${album.id}`,
   };
 }
@@ -99,7 +99,9 @@ async function handle(request: Request) {
   const state = decodeState(request);
   const method = request.method;
 
-  if (method === 'GET' && path[0] === 'albums') return json(request, state, { albums: albums.map(albumPayload) });
+  if (method === 'GET' && path[0] === 'albums') {
+    return json(request, state, { albums: albums.map((album) => albumPayload(album, url.origin)) });
+  }
 
   if (method === 'GET' && path[0] === 'status') {
     const album = selectedAlbum(state);
@@ -177,7 +179,24 @@ async function handle(request: Request) {
 
   if (path[0] === 'cd-sets' && path.length === 1 && method === 'POST') {
     const name = (url.searchParams.get('name') ?? 'New set').slice(0, 80);
-    state.sets.push({ id: crypto.randomUUID(), name, albumIds: [...state.discIds] });
+    if (state.sets.some((set) => set.name.localeCompare(name, undefined, { sensitivity: 'base' }) === 0)) {
+      return json(request, state, { detail: 'A CD Set with that name already exists' }, 409);
+    }
+    const selected = url.searchParams.has('title') ? findAlbum(url) : null;
+    if (url.searchParams.has('title') && !selected) {
+      return json(request, state, { detail: 'That demonstration album was not found.' }, 404);
+    }
+    state.sets.push({ id: crypto.randomUUID(), name, albumIds: selected ? [selected.id] : [...state.discIds] });
+    return json(request, state, { ok: true });
+  }
+
+  if (path[0] === 'cd-sets' && path[1] && path[2] === 'albums' && method === 'POST') {
+    const set = state.sets.find((item) => item.id === path[1]);
+    if (!set) return json(request, state, { detail: 'CD set not found.' }, 404);
+    const album = findAlbum(url);
+    if (!album) return json(request, state, { detail: 'That demonstration album was not found.' }, 404);
+    if (set.albumIds.includes(album.id)) return json(request, state, { detail: `${album.title} is already in ${set.name}` }, 409);
+    set.albumIds.push(album.id);
     return json(request, state, { ok: true });
   }
 

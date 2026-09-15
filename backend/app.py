@@ -1,4 +1,6 @@
 import os
+from typing import Optional
+from urllib.parse import urljoin
 
 from fastapi import FastAPI, HTTPException, Query
 import soco
@@ -9,6 +11,18 @@ app = FastAPI(title="Sonos CD Player")
 
 def get_speaker():
     return soco.SoCo(os.environ.get("SONOS_SPEAKER_IP", "192.168.1.85"))
+
+
+def get_volume_target(speaker):
+    """Use Sonos group volume when grouped, or the speaker for a single-room group."""
+    return getattr(speaker, "group", None) or speaker
+
+
+def album_art_url(speaker, uri):
+    """Resolve Sonos's usual relative artwork paths against the configured player."""
+    if not uri:
+        return None
+    return urljoin(f"http://{speaker.ip_address}:1400/", uri)
 
 
 def prepare_playback(speaker):
@@ -80,7 +94,7 @@ def albums():
         result.append({
             "title": album.title,
             "artist": getattr(album, "creator", None),
-            "album_art_uri": getattr(album, "album_art_uri", None),
+            "album_art_uri": album_art_url(speaker, getattr(album, "album_art_uri", None)),
             "uri": getattr(album, "resources", [None])[0].uri
                 if getattr(album, "resources", None)
                 else None,
@@ -95,7 +109,7 @@ from changer import Changer
 changer = Changer(get_speaker, prepare_playback=prepare_playback)
 
 @app.post("/play-album")
-def play_album(title: str, artist: str | None = None):
+def play_album(title: str, artist: Optional[str] = None):
     """Append an album as a disc and start it, preserving the existing queue."""
     return changer.load(title, artist, play=True)
 
@@ -104,7 +118,7 @@ def loaded_discs():
     return changer.listing()
 
 @app.post("/discs/load")
-def load_disc(title: str, artist: str | None = None):
+def load_disc(title: str, artist: Optional[str] = None):
     return changer.load(title, artist)
 
 @app.get("/cd-sets")
@@ -112,12 +126,16 @@ def cd_sets():
     return changer.list_sets()
 
 @app.post("/cd-sets")
-def save_cd_set(name: str):
-    return changer.create_set(name)
+def save_cd_set(name: str, title: Optional[str] = None, artist: Optional[str] = None):
+    return changer.create_set_from_album(name, title, artist) if title is not None else changer.create_set(name)
 
 @app.put("/cd-sets/{set_id}")
 def overwrite_cd_set(set_id: str):
     return changer.overwrite_set(set_id)
+
+@app.post("/cd-sets/{set_id}/albums")
+def add_album_to_cd_set(set_id: str, title: str, artist: Optional[str] = None):
+    return changer.add_album_to_set(set_id, title, artist)
 
 @app.delete("/cd-sets/{set_id}")
 def delete_cd_set(set_id: str):
@@ -161,13 +179,14 @@ def eject_disc(disc_id: str):
 @app.get("/status")
 def status():
     speaker = get_speaker()
+    volume_target = get_volume_target(speaker)
 
     return {
         "transport": speaker.get_current_transport_info(),
         "track": speaker.get_current_track_info(),
         "queue_size": speaker.queue_size,
-        "volume": speaker.volume,
-        "muted": speaker.mute,
+        "volume": volume_target.volume,
+        "muted": volume_target.mute,
     }
 
 @app.post("/test-queue")
@@ -230,14 +249,16 @@ def previous_track():
 @app.get("/volume")
 def volume():
     speaker = get_speaker()
-    return {"volume": speaker.volume, "muted": speaker.mute}
+    volume_target = get_volume_target(speaker)
+    return {"volume": volume_target.volume, "muted": volume_target.mute}
 
 
 @app.post("/volume")
 def set_volume(level: int = Query(..., ge=0, le=100)):
     speaker = get_speaker()
-    speaker.volume = level
-    return {"volume": speaker.volume, "muted": speaker.mute}
+    volume_target = get_volume_target(speaker)
+    volume_target.volume = level
+    return {"volume": volume_target.volume, "muted": volume_target.mute}
 
 
 @app.get("/transport")

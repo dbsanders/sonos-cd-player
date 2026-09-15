@@ -16,7 +16,7 @@ Implementation: `SonosCDPlayer/VintageChangerView.swift`. It shares the existing
 
 ## CD Sets
 
-Use the **CD Library** and **CD Sets** buttons at the top of the iPad collection to switch views. Saved sets show artwork from an album in the set (or a disc placeholder if artwork is unavailable). Select a card to reveal **Play now** and **Delete this set**. Play now replaces the entire queue with the set and starts playback; deleting a set leaves playback unchanged.
+Use the **CD Library** and **CD Sets** buttons at the top of the iPad collection to switch views. Saved sets show artwork from an album in the set (or a disc placeholder if artwork is unavailable). Select a card to reveal **Play now** and **Delete this set**, or drag the card sideways to the player. Play now and a successful drop replace the entire queue with the set and start playback; deleting a set leaves playback unchanged.
 
 Choose **Save CD Set** on the player to create a named set or select an existing set to overwrite with the current magazine. Overwrite preserves the set’s name and does not interrupt playback. The separate shuffle menu retains **Shuffle CDs when loading** and **Shuffle Loaded CDs & Play**. The iPhone tray also has Save CD Set, with saved-set playback and deletion in its playback options menu.
 
@@ -28,7 +28,7 @@ The **Sort by** selector orders the library by **Artist** or **Album name**, inc
 
 ## Loading and track navigation
 
-Tap a library case to select it and reveal a **Play now** button. Only pressing **Play now** starts playback, loading the CD first if needed; an already-loaded CD plays without adding a duplicate. Selecting another case moves the selection. VoiceOver follows the same select-then-play flow. Dragging still loads without starting playback.
+Tap a library case to select it and reveal **Play now** and **Add to CD Set**. Add to CD Set appends the album to an existing set or creates a new set containing that album without changing playback or the loaded magazine. Only pressing **Play now** starts playback, loading the CD first if needed; an already-loaded CD plays without adding a duplicate. Selecting another case moves the selection. VoiceOver exposes the same actions. Dragging still loads without starting playback.
 
 Pull an unloaded case sideways, then release it over the player. No long press is required. The case follows the pointer or finger and the player highlights while it is a valid destination. A UIKit horizontal pan recognizer yields vertical gestures to collection scrolling. The preview and drop target use live UIKit view coordinates, including in resized iPad windows; scrolling configuration stays stable throughout the gesture. Accepted drops wait for an in-flight status refresh instead of being discarded. Loaded albums are grey with a Loaded badge and cannot be dropped again. VoiceOver offers a Load into magazine action. A successful backend response triggers the disc insertion or ejection animation; Reduce Motion uses a brief fade. Newly loaded discs scroll into view.
 

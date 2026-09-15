@@ -3,10 +3,13 @@ import UIKit
 
 private let amber = Color(red: 1, green: 0.66, blue: 0.25)
 private let ink = Color(red: 0.08, green: 0.085, blue: 0.085)
+private let librarySurface = Color(red: 0.105, green: 0.125, blue: 0.135)
+private let machineSurface = Color(red: 0.105, green: 0.095, blue: 0.08)
 
 struct VintageChangerView: View {
     @Bindable var player: Player
     let settings: () -> Void
+    let help: () -> Void
     let resync: () -> Void
     private enum SearchField: Hashable { case library, sets }
     @FocusState private var focusedSearch: SearchField?
@@ -17,10 +20,12 @@ struct VintageChangerView: View {
     @State private var setSearch = ""
     @State private var selectedSetID: String?
     @State private var deletingSet: CDSet?
+    @State private var addingAlbum: Album?
     @AppStorage("shuffleCDSets") private var shuffleSets = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var targeted = false
     @State private var draggedAlbum: Album?
+    @State private var draggedSet: CDSet?
     @State private var draggedDisc: Disc?
     @State private var libraryTargeted = false
     @State private var dragPoint: CGPoint = .zero
@@ -49,6 +54,18 @@ struct VintageChangerView: View {
             let success = await player.load(album, play: play)
             if success && !wasLoaded { await animateDisc(album, eject: false) }
             operation = nil
+        }
+    }
+    private func playCDSet(_ cdSet: CDSet) {
+        guard operation == nil, !player.draggingAlbum, player.setsAvailable else { return }
+        operation = "PLAYING SET · " + cdSet.name
+        Task { @MainActor in
+            defer { operation = nil }
+            while player.busy {
+                do { try await Task.sleep(for: .milliseconds(50)) } catch { return }
+            }
+            guard player.cdSets.contains(where: { $0.id == cdSet.id }) else { return }
+            await player.playSet(cdSet, shuffle: shuffleSets)
         }
     }
     private func ejectDisc(_ disc: Disc) {
@@ -95,10 +112,11 @@ struct VintageChangerView: View {
             VStack(spacing: 0) {
                 header
                 if wide {
-                    HStack(alignment: .top, spacing: 22) {
+                    HStack(alignment: .top, spacing: 0) {
                         library.frame(maxWidth: .infinity)
+                        paneSeam.padding(.horizontal, 12)
                         machine.frame(width: min(460, geometry.size.width * 0.43))
-                    }.padding(24)
+                    }.frame(maxHeight: .infinity).padding(24)
                 } else {
                     ScrollView {
                         VStack(spacing: 24) {
@@ -122,25 +140,41 @@ struct VintageChangerView: View {
             .onChange(of: showingSets) { _, _ in focusedSearch = nil }
             .scrollDismissesKeyboard(.interactively)
         }
+        .sheet(item: $addingAlbum) { album in
+            AddAlbumToSetSheet(player: player, album: album)
+        }
     }
     private var header: some View {
         HStack(spacing: 16) {
             VStack(alignment: .leading, spacing: 3) {
-                Text("STEREO").font(.system(size: 24, weight: .black, design: .rounded)).tracking(5)
-                Text(player.demoMode ? "FICTIONAL COMPACT DISC COLLECTION" : "GRAMMY'S COMPACT DISC COLLECTION")
+                Text("NOT STREAMING").font(.system(size: 24, weight: .black, design: .rounded)).tracking(5)
+                Text(player.demoMode ? "FICTIONAL COMPACT DISC COLLECTION" : "I ALREADY BOUGHT IT!")
                     .font(.system(size: 9, weight: .medium, design: .monospaced)).tracking(2)
             }
             Spacer()
             HStack(spacing: 8) {
                 Circle().fill(player.connected ? amber : .gray).frame(width: 6, height: 6)
                     .shadow(color: player.connected ? amber.opacity(0.7) : .clear, radius: 5)
-                Text(player.demoMode ? "DEMO · FICTIONAL LIBRARY" : (player.connected ? "GARAGE CONNECTED" : "GARAGE OFFLINE"))
+                Text(player.demoMode ? "DEMO · FICTIONAL LIBRARY" : "\(player.speakerDisplayName.uppercased()) \(player.connected ? "CONNECTED" : "OFFLINE")")
                     .font(.system(size: 10, weight: .bold, design: .monospaced)).tracking(1)
             }
+            Button(action: help) { Image(systemName: "questionmark.circle").frame(width: 44, height: 44) }
+                .buttonStyle(HardwareButtonStyle()).accessibilityLabel("Help")
             Button(action: settings) { Image(systemName: "gearshape").frame(width: 44, height: 44) }
                 .buttonStyle(HardwareButtonStyle()).accessibilityLabel("Connection settings")
         }.foregroundStyle(Color(white: 0.78)).padding(.horizontal, 24).padding(.vertical, 12)
             .background(Color(white: 0.12)).overlay(alignment: .bottom) { Rectangle().fill(.white.opacity(0.08)).frame(height: 1) }
+    }
+    private var paneSeam: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(LinearGradient(colors: [.white.opacity(0.08), .black.opacity(0.72), .white.opacity(0.025)], startPoint: .leading, endPoint: .trailing))
+            Rectangle().fill(.black.opacity(0.65)).frame(width: 2)
+        }
+        .frame(width: 8).frame(maxHeight: .infinity)
+        .padding(.vertical, 6)
+        .shadow(color: .black.opacity(0.55), radius: 4, x: 2)
+        .accessibilityHidden(true)
     }
     private var dismissSearchKeyboard: some View {
         Button("Done") { focusedSearch = nil }
@@ -207,7 +241,7 @@ struct VintageChangerView: View {
                                 }
                                 .accessibilityAddTraits(.isButton)
                                 .accessibilityAddTraits(selectedAlbumID == album.id ? .isSelected : [])
-                                .accessibilityHint("Select this CD to show the Play now button.")
+                                .accessibilityHint("Select this CD to show playback and CD Set actions.")
                                 .accessibilityAction { selectAlbum(album) }
                                 .overlay {
                                     RoundedRectangle(cornerRadius: 5)
@@ -216,13 +250,22 @@ struct VintageChangerView: View {
                                 }
                                 .animation(.easeInOut(duration: 0.25), value: player.isLoaded(album))
                                 if selectedAlbumID == album.id {
-                                    Button { loadAlbum(album, play: true) } label: {
-                                        Label("Play now", systemImage: "play.fill")
-                                            .font(.system(size: 12, weight: .semibold))
-                                            .frame(maxWidth: .infinity).frame(minHeight: 44)
-                                    }.buttonStyle(HardwareButtonStyle())
-                                        .disabled(operation != nil || player.busy || player.draggingAlbum || player.staleQueue)
-                                        .accessibilityLabel("Play now, \(album.title)")
+                                    VStack(spacing: 8) {
+                                        Button { loadAlbum(album, play: true) } label: {
+                                            Label("Play now", systemImage: "play.fill")
+                                                .font(.system(size: 12, weight: .semibold))
+                                                .frame(maxWidth: .infinity).frame(minHeight: 44)
+                                        }.buttonStyle(HardwareButtonStyle())
+                                            .disabled(operation != nil || player.busy || player.draggingAlbum || player.staleQueue)
+                                            .accessibilityLabel("Play now, \(album.title)")
+                                        Button { addingAlbum = album } label: {
+                                            Label("Add to CD Set", systemImage: "text.badge.plus")
+                                                .font(.system(size: 12, weight: .semibold))
+                                                .frame(maxWidth: .infinity).frame(minHeight: 44)
+                                        }.buttonStyle(HardwareButtonStyle())
+                                            .disabled(operation != nil || player.busy || player.draggingAlbum || !player.setsAvailable)
+                                            .accessibilityLabel("Add \(album.title) to a CD Set")
+                                    }
                                 }
                             }
 
@@ -237,6 +280,17 @@ struct VintageChangerView: View {
                 Text(draggedDisc != nil ? "RELEASE OVER THE COLLECTION TO UNLOAD" : "TAP TO SELECT · DRAG TO LOAD OR UNLOAD").font(.system(size: 9, design: .monospaced)).tracking(1.3).foregroundStyle(.white.opacity(0.35))
             }
         }
+        .padding(18)
+        .background(
+            LinearGradient(
+                colors: [librarySurface.opacity(0.98), librarySurface.opacity(0.78)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            ),
+            in: RoundedRectangle(cornerRadius: 12)
+        )
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.white.opacity(0.13), lineWidth: 1))
+        .shadow(color: .black.opacity(0.38), radius: 10, y: 6)
         .background { AlbumCoordinateSurface(space: dragSpace, region: .library).allowsHitTesting(false) }
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(libraryTargeted ? amber : .clear, lineWidth: 3))
         .overlay(alignment: .top) {
@@ -305,7 +359,7 @@ struct VintageChangerView: View {
             }
             .contentShape(Rectangle())
             .simultaneousGesture(TapGesture().onEnded { focusedSearch = nil })
-            Text("SELECT A SET, THEN PLAY NOW").font(.system(size: 9, design: .monospaced)).tracking(1.3).foregroundStyle(.white.opacity(0.35))
+            Text("SELECT A SET, OR DRAG IT TO THE PLAYER TO PLAY").font(.system(size: 9, design: .monospaced)).tracking(1.3).foregroundStyle(.white.opacity(0.35))
         }
         .onChange(of: setSearch) { _, _ in selectedSetID = nil }
         .confirmationDialog("Delete \(deletingSet?.name ?? "set")?", isPresented: Binding(get: { deletingSet != nil }, set: { if !$0 { deletingSet = nil } }), titleVisibility: .visible) {
@@ -317,15 +371,27 @@ struct VintageChangerView: View {
     }
     private func setCard(_ cdSet: CDSet) -> some View {
         VStack(spacing: 10) {
-            Button { focusedSearch = nil; selectedSetID = cdSet.id } label: { JewelCase(album: setCover(cdSet)) }
-                .buttonStyle(.plain)
+            JewelCase(album: setCover(cdSet))
+                .contentShape(Rectangle())
+                .opacity(draggedSet?.id == cdSet.id ? 0.25 : 1)
                 .overlay(RoundedRectangle(cornerRadius: 5).stroke(selectedSetID == cdSet.id ? amber : .clear, lineWidth: 2))
+                .overlay {
+                    AlbumPanSurface(space: dragSpace, tapped: {
+                        focusedSearch = nil
+                        selectedSetID = cdSet.id
+                    }) { point, overPlayer, ended, cancelled in
+                        handleSetDrag(cdSet, point: point, overPlayer: overPlayer, ended: ended, cancelled: cancelled)
+                    }.accessibilityHidden(true)
+                }
                 .accessibilityLabel("\(cdSet.name), \(cdSet.albums.count) CDs")
-                .accessibilityHint("Select to show Play now and Delete this set.")
+                .accessibilityHint("Select for actions, or drag sideways to the player to play this set.")
                 .accessibilityAddTraits(selectedSetID == cdSet.id ? .isSelected : [])
+                .accessibilityAddTraits(.isButton)
+                .accessibilityAction { focusedSearch = nil; selectedSetID = cdSet.id }
+                .accessibilityAction(named: "Play this CD Set") { playCDSet(cdSet) }
             if selectedSetID == cdSet.id {
                 Text("Replaces all CDs in the player.").font(.caption).foregroundStyle(.secondary)
-                Button { Task { await player.playSet(cdSet, shuffle: shuffleSets) } } label: {
+                Button { playCDSet(cdSet) } label: {
                     Label("Play now", systemImage: "play.fill").font(.system(size: 12, weight: .semibold))
                         .frame(maxWidth: .infinity).frame(minHeight: 44)
                 }.buttonStyle(HardwareButtonStyle()).accessibilityLabel("Play now, \(cdSet.name)")
@@ -334,7 +400,7 @@ struct VintageChangerView: View {
                         .frame(maxWidth: .infinity).frame(minHeight: 44)
                 }.buttonStyle(HardwareButtonStyle()).accessibilityLabel("Delete this set, \(cdSet.name)")
             }
-        }.disabled(operation != nil || player.busy || player.draggingAlbum || !player.setsAvailable)
+        }.disabled(operation != nil || player.busy || !player.setsAvailable)
     }
     private var machine: some View {
         VStack(spacing: 0) {
@@ -386,16 +452,23 @@ struct VintageChangerView: View {
                     }.frame(minHeight: 100)
                     VintageTransport(player: player)
                 }.padding(18)
-            }.background(Color(white: 0.12))
+            }.background(
+                LinearGradient(
+                    colors: [machineSurface.opacity(0.98), Color(red: 0.065, green: 0.06, blue: 0.052)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            )
                 .clipShape(RoundedRectangle(cornerRadius: 10))
-                .overlay(RoundedRectangle(cornerRadius: 10).stroke(.white.opacity(0.08), lineWidth: 1))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(.white.opacity(0.15), lineWidth: 1))
+                .shadow(color: .black.opacity(0.58), radius: 12, x: -2, y: 8)
         }
         .contentShape(Rectangle())
         .simultaneousGesture(TapGesture().onEnded { focusedSearch = nil })
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(targeted ? amber : .clear, lineWidth: 3))
         .overlay(alignment: .top) {
             if targeted || operation != nil {
-                Text(operation ?? "RELEASE TO LOAD INTO MAGAZINE")
+                Text(operation ?? (draggedSet == nil ? "RELEASE TO LOAD INTO MAGAZINE" : "RELEASE TO PLAY CD SET"))
                     .font(.system(size: 11, weight: .bold, design: .monospaced)).lineLimit(2)
                     .padding(12).frame(maxWidth: .infinity).background(amber).foregroundStyle(.black)
                     .clipShape(RoundedRectangle(cornerRadius: 5)).padding(8)
@@ -436,12 +509,30 @@ struct VintageChangerView: View {
         targeted = overPlayer
     }
 
+    private func handleSetDrag(_ cdSet: CDSet, point: CGPoint, overPlayer: Bool, ended: Bool, cancelled: Bool) {
+        if ended {
+            guard draggedSet?.id == cdSet.id else { return }
+            let accepted = !cancelled && overPlayer
+            clearDrag()
+            if accepted { playCDSet(cdSet) }
+            return
+        }
+        guard operation == nil, player.setsAvailable else { return }
+        selectedSetID = nil
+        draggedSet = cdSet
+        draggedAlbum = setCover(cdSet)
+        player.draggingAlbum = true
+        dragPoint = point
+        targeted = overPlayer
+    }
+
     private func albumForDisc(_ disc: Disc) -> Album {
         player.albums.first { $0.title == disc.album && $0.artist == disc.artist }
             ?? Album(title: disc.album, artist: disc.artist, album_art_uri: nil, uri: nil)
     }
     private func clearDrag() {
         draggedAlbum = nil
+        draggedSet = nil
         draggedDisc = nil
         targeted = false
         libraryTargeted = false
@@ -576,7 +667,7 @@ private struct VintageTransport: View {
                             }
                         }
                     }.tint(amber).disabled(player.busy || player.status?.volume == nil)
-                        .accessibilityLabel("\(player.demoMode ? "Sonos Speaker" : "Garage") volume").accessibilityValue("\(Int(volume)) percent")
+                        .accessibilityLabel("\(player.demoMode ? "Sonos Speaker" : player.speakerDisplayName) volume").accessibilityValue("\(Int(volume)) percent")
                 }.foregroundStyle(.white.opacity(0.5))
             }
         }.onAppear { volume = Double(player.status?.volume ?? 0) }
@@ -597,12 +688,12 @@ private struct JewelCase: View {
         VStack(alignment: .leading, spacing: 9) {
             ZStack(alignment: .leading) {
                 GeometryReader { geo in
-                    AsyncImage(url: album.album_art_uri.flatMap { URL(string: $0, relativeTo: URL(string: "http://192.168.1.85:1400")) }) { image in image.resizable().scaledToFill() } placeholder: {
+                    CachedArtworkImage(url: AlbumArtwork.url(for: album.album_art_uri)) {
                         ZStack {
                             LinearGradient(colors: [Color(white: 0.3), Color(white: 0.1)], startPoint: .topLeading, endPoint: .bottomTrailing)
                             Image(systemName: "opticaldisc").font(.system(size: 55, weight: .ultraLight)).foregroundStyle(.white.opacity(0.3))
                         }
-                    }.frame(width: geo.size.width, height: geo.size.height).clipped()
+                    }.scaledToFill().frame(width: geo.size.width, height: geo.size.height).clipped()
                 }
                 Rectangle().fill(.black.opacity(0.65)).frame(width: 9)
                 Rectangle().fill(.white.opacity(0.13)).frame(width: 2).padding(.leading, 10)
@@ -615,6 +706,79 @@ private struct JewelCase: View {
         }.foregroundStyle(.white.opacity(0.85))
     }
 }
+
+private struct AddAlbumToSetSheet: View {
+    @Bindable var player: Player
+    let album: Album
+    @Environment(\.dismiss) private var dismiss
+    @State private var destinationID = ""
+    @State private var newSetName = ""
+
+    private func includesAlbum(_ cdSet: CDSet) -> Bool {
+        cdSet.albums.contains { entry in
+            entry.title.compare(album.title, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame &&
+            (entry.artist ?? "").compare(album.artist ?? "", options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+        }
+    }
+    private var availableSets: [CDSet] { player.cdSets.filter { !includesAlbum($0) } }
+    private var selectedSet: CDSet? { availableSets.first { $0.id == destinationID } }
+    private var trimmedName: String { newSetName.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var canSubmit: Bool {
+        !player.busy && (destinationID.isEmpty ? !trimmedName.isEmpty && trimmedName.count <= 80 : selectedSet != nil)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Selected CD") {
+                    LabeledContent("Album", value: album.title)
+                    LabeledContent("Artist", value: album.artist ?? "Unknown artist")
+                }
+                Section("Add to") {
+                    Picker("CD Set", selection: $destinationID) {
+                        Text("Create a new set").tag("")
+                        ForEach(availableSets) { cdSet in
+                            Text(cdSet.name).tag(cdSet.id)
+                        }
+                    }
+                    if destinationID.isEmpty {
+                        TextField("New set name", text: $newSetName)
+                    }
+                    if availableSets.count < player.cdSets.count {
+                        Text("Sets that already contain this CD are omitted.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
+                Section {
+                    Text("The CD will be appended to the set. Current playback and the loaded magazine will not change.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Add to CD Set")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(destinationID.isEmpty ? "Create" : "Add") {
+                        let cdSet = selectedSet
+                        Task {
+                            if await player.addAlbum(album, to: cdSet, newSetName: trimmedName) {
+                                dismiss()
+                            }
+                        }
+                    }.disabled(!canSubmit)
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .alert("Couldn’t add CD", isPresented: Binding(get: { player.error != nil }, set: { if !$0 { player.error = nil } })) {
+            Button("OK") { player.error = nil }
+        } message: { Text(player.error ?? "") }
+    }
+}
+
 private struct HardwareButtonStyle: ButtonStyle {
     @Environment(\.isEnabled) private var enabled
     func makeBody(configuration: Configuration) -> some View {

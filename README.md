@@ -25,7 +25,7 @@ The library shows all 587 currently indexed albums. The app supports loading alb
 
 ## CD Sets
 
-On iPad, switch between **CD Library** and **CD Sets** above the collection. Select a saved set’s artwork card to reveal **Play now** and **Delete this set**. Choose **Save CD Set** on the player to create a new set or select an existing set to overwrite with the currently loaded albums, without interrupting playback. New names must be unique (ignoring case), with 1–80 characters. The iPhone Disc tray retains set playback and deletion in its playback options menu.
+On iPad, switch between **CD Library** and **CD Sets** above the collection. Select an album to reveal **Play now** and **Add to CD Set**; adding can append the album to an existing set or create a new single-album set without changing playback. Select a saved set’s artwork card to reveal **Play now** and **Delete this set**, or drag the set to the player to replace the magazine and begin playback. Choose **Save CD Set** on the player to create a new set or select an existing set to overwrite with the currently loaded albums, without interrupting playback. New names must be unique (ignoring case), with 1–80 characters. The iPhone Disc tray retains set playback and deletion in its playback options menu.
 
 Selecting a saved set immediately stops playback and clears the entire Sonos queue, including tracks added outside this app. The backend then resolves and loads the saved albums and starts the first track. **Shuffle CDs when loading** randomizes album order for each selection. **Shuffle Loaded CDs & Play** replaces the current queue with the loaded CDs in random order and restarts playback. Both keep tracks in their library order within each CD and set Sonos playback mode to Normal (track shuffle and repeat off). Shuffling does not change the saved set.
 
@@ -79,9 +79,11 @@ Verify deployment using `/discs`, `/status`, and `/albums`. The container uses h
 | POST | `/play` or `/pause` | Resume or pause |
 | POST | `/tracks/next` or `/tracks/previous` | Native Sonos next/previous track |
 | GET | `/status` | Track, transport, queue size, volume, mute state |
-| GET / POST | `/volume` | Read volume; set using `?level=0` through `100` |
+| GET / POST | `/volume` | Read group volume; set using `?level=0` through `100` |
 | POST | `/discs/resync` | Forget disc assignments after external queue edits, keeping tracks |
 | GET / POST | `/cd-sets` | List saved sets; save current loaded CDs using `?name=...` |
+| POST | `/cd-sets?name=...&title=...&artist=...` | Create a set containing one selected library album |
+| POST | `/cd-sets/{id}/albums?title=...&artist=...` | Append a selected library album without changing playback |
 | DELETE | `/cd-sets/{id}` | Delete a saved set without changing playback |
 | PUT | `/cd-sets/{id}` | Overwrite a saved set with the currently loaded CDs, preserving its name |
 | POST | `/cd-sets/{id}/play` | Stop, clear, load, and play a set; optional `?shuffle=true` |

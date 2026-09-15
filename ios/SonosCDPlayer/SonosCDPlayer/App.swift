@@ -40,6 +40,7 @@ struct LibrarySortSelector: View {
 }
 
 struct AlbumList: Decodable { let albums: [Album] }
+struct SpeakerInfo: Decodable { let name: String }
 struct Disc: Decodable, Identifiable {
     let id: String
     let album: String
@@ -88,10 +89,17 @@ struct CDSetList: Decodable { let sets: [CDSet] }
     var cdSets: [CDSet] = []
     var setsAvailable = false
     var setOperation: String?
+    var speakerName: String?
     var demoMode = (UserDefaults.standard.object(forKey: "demoMode") as? Bool) ?? true
     var address = UserDefaults.standard.string(forKey: "server") ?? "http://192.168.1.100:8000"
     var activeAddress: String { demoMode ? Self.demoAddress : address }
+    var speakerDisplayName: String {
+        if demoMode { return "Demo" }
+        let trimmed = speakerName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? "Sonos" : trimmed
+    }
     private var libraryLoaded = false
+    private var artworkPrefetchTask: Task<Void, Never>?
     private let session: URLSession = {
         let configuration = URLSessionConfiguration.default
         // Give the first Local Network permission prompt time to complete.
@@ -106,8 +114,18 @@ struct CDSetList: Decodable { let sets: [CDSet] }
     }()
 
     func resetLibrary() {
+        artworkPrefetchTask?.cancel()
+        artworkPrefetchTask = nil
         albums = []
         libraryLoaded = false
+    }
+
+    private func prefetchArtwork() {
+        artworkPrefetchTask?.cancel()
+        let paths = albums.map(\.album_art_uri)
+        artworkPrefetchTask = Task(priority: .utility) {
+            await AlbumArtwork.prefetch(paths)
+        }
     }
 
     func request(_ path: String, method: String = "GET", query: [URLQueryItem] = [], longRunning: Bool = false) async throws -> Data {
@@ -154,11 +172,15 @@ struct CDSetList: Decodable { let sets: [CDSet] }
         busy = true
         defer { busy = false }
         do {
+            if !demoMode && (library || speakerName == nil) {
+                await refreshSpeakerInfo()
+            }
             try await refreshSets()
             if library || !libraryLoaded {
                 let data = try await request("/albums")
                 albums = try JSONDecoder().decode(AlbumList.self, from: data).albums
                 libraryLoaded = true
+                prefetchArtwork()
             }
             try await refreshPlayback()
             connected = true
@@ -166,6 +188,11 @@ struct CDSetList: Decodable { let sets: [CDSet] }
             connected = false
             if !silent { self.error = error.localizedDescription }
         }
+    }
+    private func refreshSpeakerInfo() async {
+        guard let data = try? await request("/speaker"),
+              let info = try? JSONDecoder().decode(SpeakerInfo.self, from: data) else { return }
+        speakerName = info.name
     }
     private func refreshSets() async throws {
         do {
@@ -190,6 +217,28 @@ struct CDSetList: Decodable { let sets: [CDSet] }
             }
             try await refreshSets()
             notice = "Saved \(name)"
+            return true
+        } catch { self.error = error.localizedDescription; return false }
+    }
+    func addAlbum(_ album: Album, to cdSet: CDSet?, newSetName: String = "") async -> Bool {
+        guard !busy else { return false }
+        busy = true
+        defer { busy = false }
+        let albumQuery = [
+            URLQueryItem(name: "title", value: album.title),
+            URLQueryItem(name: "artist", value: album.artist)
+        ]
+        do {
+            let destinationName: String
+            if let cdSet {
+                _ = try await request("/cd-sets/\(cdSet.id)/albums", method: "POST", query: albumQuery)
+                destinationName = cdSet.name
+            } else {
+                destinationName = newSetName.trimmingCharacters(in: .whitespacesAndNewlines)
+                _ = try await request("/cd-sets", method: "POST", query: [URLQueryItem(name: "name", value: destinationName)] + albumQuery)
+            }
+            try await refreshSets()
+            notice = "Added \(album.title) to \(destinationName)"
             return true
         } catch { self.error = error.localizedDescription; return false }
     }
@@ -277,6 +326,7 @@ struct ContentView: View {
     @State private var search = ""
     @AppStorage("cdLibrarySort") private var librarySort: LibrarySort = .album
     @State private var settings = false
+    @State private var showingHelp = false
     @State private var resync = false
     var filtered: [Album] {
         player.albums.filter { search.isEmpty || ($0.title + " " + ($0.artist ?? "")).localizedCaseInsensitiveContains(search) }.sorted(by: librarySort.precedes)
@@ -284,7 +334,12 @@ struct ContentView: View {
     var body: some View {
         Group {
             if UIDevice.current.userInterfaceIdiom == .pad && sizeClass != .compact {
-                VintageChangerView(player: player, settings: { settings = true }, resync: { resync = true })
+                VintageChangerView(
+                    player: player,
+                    settings: { settings = true },
+                    help: { showingHelp = true },
+                    resync: { resync = true }
+                )
             } else {
                 phoneTabs
             }
@@ -298,6 +353,7 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $settings) { SettingsView(player: player) }
+        .sheet(isPresented: $showingHelp) { HelpView() }
         .alert("Couldn’t complete that", isPresented: Binding(get: { player.error != nil }, set: { if !$0 { player.error = nil } })) {
             Button("OK") { player.error = nil }
         } message: { Text(player.error ?? "") }
@@ -311,7 +367,7 @@ struct ContentView: View {
                 List {
                     Section {
                         VStack(alignment: .leading, spacing: 10) {
-                            Label(player.demoMode ? "DEMO LIBRARY" : "GARAGE", systemImage: player.demoMode ? "sparkles" : "hifispeaker.fill")
+                            Label(player.demoMode ? "DEMO LIBRARY" : player.speakerDisplayName.uppercased(), systemImage: player.demoMode ? "sparkles" : "hifispeaker.fill")
                                 .font(.caption.weight(.bold)).foregroundStyle(.orange)
                             Text("Your collection.\nReady to play.").font(.largeTitle.bold())
                             Text("Load an album into the tray, then choose a disc to start listening.").foregroundStyle(.secondary)
@@ -396,7 +452,7 @@ struct ContentView: View {
                     Image(systemName: "opticaldisc.fill").font(.system(size: 120)).foregroundStyle(.orange.gradient)
                     VStack(spacing: 8) {
                         Text(player.status?.track["title"].flatMap { $0.isEmpty ? nil : $0 } ?? "Nothing playing").font(.title.bold()).multilineTextAlignment(.center)
-                        Text(player.status?.track["artist"] ?? (player.demoMode ? "Demo player" : "Garage")).foregroundStyle(.secondary)
+                        Text(player.status?.track["artist"] ?? (player.demoMode ? "Demo player" : player.speakerDisplayName)).foregroundStyle(.secondary)
                         Text(player.status?.track["album"] ?? "").font(.subheadline).foregroundStyle(.secondary)
                     }
                     Text(player.status?.transport["current_transport_state"]?.replacingOccurrences(of: "_", with: " ").capitalized ?? "Not connected").font(.caption.weight(.semibold)).foregroundStyle(.orange)
@@ -410,11 +466,114 @@ struct ContentView: View {
         ToolbarItem(placement: .topBarLeading) {
             HStack(spacing: 5) {
                 Circle().fill(player.connected ? Color.green : Color.gray).frame(width: 6, height: 6)
-                Text(player.demoMode ? "Demo" : (player.connected ? "Garage" : "Offline")).font(.caption).fixedSize()
+                Text(player.demoMode ? "Demo" : (player.connected ? player.speakerDisplayName : "Offline")).font(.caption).fixedSize()
                 if player.busy { ProgressView().controlSize(.mini) }
             }
         }
         ToolbarItem(placement: .topBarTrailing) { Button("Settings", systemImage: "gearshape") { settings = true } }
+    }
+}
+
+private struct HelpView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    private let tasks = [
+        HelpTask(
+            title: "Loading a CD",
+            icon: "arrow.right.circle.fill",
+            steps: [
+                "Find the album in CD Library.",
+                "Drag its cover onto the player and release when the player outline turns amber.",
+                "To load it and start listening immediately, tap the cover and choose Play now."
+            ]
+        ),
+        HelpTask(
+            title: "Unloading a CD",
+            icon: "eject.fill",
+            steps: [
+                "Find the CD in the player’s Disc Magazine.",
+                "Drag its title onto the collection and release when the collection outline turns amber.",
+                "You can also use the eject button beside that CD."
+            ]
+        ),
+        HelpTask(
+            title: "Saving a CD Set",
+            icon: "square.and.arrow.down.fill",
+            steps: [
+                "Load the CDs you want into the Disc Magazine.",
+                "Choose Save CD Set on the player.",
+                "Create a named set, or select an existing set to overwrite, then save. Playback continues while the set is saved."
+            ]
+        ),
+        HelpTask(
+            title: "Choosing a Set to Play",
+            icon: "play.square.stack.fill",
+            steps: [
+                "Choose CD Sets at the top of the collection.",
+                "Drag a saved set onto the player, or select it and choose Play now.",
+                "The set replaces the current magazine and starts playing."
+            ]
+        )
+    ]
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                LazyVStack(spacing: 14) {
+                    ForEach(tasks) { task in
+                        HelpTaskCard(task: task)
+                    }
+                }
+                .padding(20)
+            }
+            .background(Color(red: 0.075, green: 0.08, blue: 0.082))
+            .navigationTitle("How to Use the Player")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+}
+
+private struct HelpTask: Identifiable {
+    let title: String
+    let icon: String
+    let steps: [String]
+    var id: String { title }
+}
+
+private struct HelpTaskCard: View {
+    let task: HelpTask
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Label(task.title, systemImage: task.icon)
+                .font(.headline)
+                .foregroundStyle(Color(red: 1, green: 0.66, blue: 0.25))
+            VStack(alignment: .leading, spacing: 11) {
+                ForEach(Array(task.steps.enumerated()), id: \.offset) { index, step in
+                    HStack(alignment: .firstTextBaseline, spacing: 12) {
+                        Text("\(index + 1)")
+                            .font(.caption.monospacedDigit().weight(.bold))
+                            .foregroundStyle(.black)
+                            .frame(width: 22, height: 22)
+                            .background(Color(red: 1, green: 0.66, blue: 0.25), in: Circle())
+                        Text(step)
+                            .font(.body)
+                            .foregroundStyle(.white.opacity(0.84))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.white.opacity(0.11), lineWidth: 1))
     }
 }
 
@@ -447,7 +606,7 @@ struct PlaybackControls: View {
             }.font(.subheadline).disabled(player.busy || (player.status?.track["uri"] ?? "").isEmpty)
             VStack(spacing: 8) {
                 HStack {
-                    Text("\(player.demoMode ? "Sonos Speaker" : "Garage") volume").font(.subheadline)
+                    Text("\(player.demoMode ? "Sonos Speaker" : player.speakerDisplayName) volume").font(.subheadline)
                     Spacer()
                     Text(player.status?.muted == true ? "Muted · \(Int(volume))%" : "\(Int(volume))%")
                         .font(.subheadline.monospacedDigit()).foregroundStyle(.secondary)
@@ -463,7 +622,7 @@ struct PlaybackControls: View {
                                 volume = Double(player.status?.volume ?? level)
                             }
                         }
-                    }.accessibilityLabel("\(player.demoMode ? "Sonos Speaker" : "Garage") volume").accessibilityValue("\(Int(volume)) percent")
+                    }.accessibilityLabel("\(player.demoMode ? "Sonos Speaker" : player.speakerDisplayName) volume").accessibilityValue("\(Int(volume)) percent")
                     Image(systemName: "speaker.wave.3.fill").foregroundStyle(.secondary)
                 }.disabled(player.busy || player.status?.volume == nil)
                 if player.status?.volume == nil {
@@ -482,11 +641,9 @@ struct PlaybackControls: View {
 struct Artwork: View {
     let path: String?
     var body: some View {
-        AsyncImage(url: path.flatMap { URL(string: $0, relativeTo: URL(string: "http://192.168.1.85:1400")) }) { image in
-            image.resizable().scaledToFill()
-        } placeholder: {
+        CachedArtworkImage(url: AlbumArtwork.url(for: path)) {
             ZStack { Color.orange.opacity(0.12); Image(systemName: "opticaldisc").font(.title).foregroundStyle(.orange) }
-        }.frame(width: 56, height: 56).clipShape(RoundedRectangle(cornerRadius: 8))
+        }.scaledToFill().frame(width: 56, height: 56).clipShape(RoundedRectangle(cornerRadius: 8))
     }
 }
 struct SettingsView: View {
@@ -511,7 +668,7 @@ struct SettingsView: View {
                     }
                 }
                 Section {
-                    Text(demoMode ? "Demo mode does not connect to your NAS or Sonos system." : "Connect to the same local network as your NAS and Garage speaker. Allow Local Network access when iOS asks.")
+                    Text(demoMode ? "Demo mode does not connect to your NAS or Sonos system." : "Connect to the same local network as your NAS and Sonos speaker. Allow Local Network access when iOS asks.")
                 }
             }.navigationTitle("Connection")
                 .toolbar {
@@ -523,6 +680,7 @@ struct SettingsView: View {
                             UserDefaults.standard.set(player.address, forKey: "server")
                             UserDefaults.standard.set(player.demoMode, forKey: "demoMode")
                             player.resetLibrary(); player.discs = []; player.status = nil; player.connected = false
+                            player.speakerName = nil
                             player.cdSets = []; player.setsAvailable = false
                             dismiss()
                             Task { await player.refresh(library: true) }

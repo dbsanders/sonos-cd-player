@@ -29,26 +29,64 @@ class Changer:
         with self.lock:
             return {'sets': self.sets}
 
-    def create_set(self, name):
+    def validate_set_name(self, name):
         name = name.strip()
         if not name or len(name) > 80:
             raise HTTPException(422, 'Enter a CD Set name between 1 and 80 characters')
+        return name
+
+    def album_entry(self, title, artist=None):
+        title = title.strip()
+        if not title:
+            raise HTTPException(422, 'Choose a CD to add')
+        return {'title': title, 'artist': artist.strip() if artist and artist.strip() else None}
+
+    def same_album(self, left, right):
+        return (left['title'].casefold() == right['title'].casefold()
+                and (left.get('artist') or '').casefold() == (right.get('artist') or '').casefold())
+
+    def create_set_record(self, name, albums):
+        if any(s['name'].casefold() == name.casefold() for s in self.sets):
+            raise HTTPException(409, 'A CD Set with that name already exists')
+        cd_set = {'id': uuid4().hex, 'name': name,
+                  'created_at': datetime.now(timezone.utc).isoformat(),
+                  'albums': albums}
+        self.sets.append(cd_set)
+        try:
+            self.save_sets()
+        except Exception:
+            self.sets.remove(cd_set)
+            raise
+        return cd_set
+
+    def create_set(self, name):
+        name = self.validate_set_name(name)
         with self.lock:
             self.check()
             if not self.state['discs']:
                 raise HTTPException(409, 'Load some CDs before saving a set')
-            if any(s['name'].casefold() == name.casefold() for s in self.sets):
-                raise HTTPException(409, 'A CD Set with that name already exists')
-            cd_set = {'id': uuid4().hex, 'name': name,
-                      'created_at': datetime.now(timezone.utc).isoformat(),
-                      'albums': [{'title': d['album'], 'artist': d['artist']} for d in self.state['discs']]}
-            self.sets.append(cd_set)
+            albums = [{'title': d['album'], 'artist': d['artist']} for d in self.state['discs']]
+            return self.create_set_record(name, albums)
+
+    def create_set_from_album(self, name, title, artist=None):
+        name = self.validate_set_name(name)
+        album = self.album_entry(title, artist)
+        with self.lock:
+            return self.create_set_record(name, [album])
+
+    def add_album_to_set(self, set_id, title, artist=None):
+        album = self.album_entry(title, artist)
+        with self.lock:
+            existing = self.find_set(set_id)
+            if any(self.same_album(saved, album) for saved in existing['albums']):
+                raise HTTPException(409, f'{title} is already in {existing["name"]}')
+            existing['albums'].append(album)
             try:
                 self.save_sets()
             except Exception:
-                self.sets.remove(cd_set)
+                existing['albums'].pop()
                 raise
-            return cd_set
+            return existing
 
     def overwrite_set(self, set_id):
         with self.lock:

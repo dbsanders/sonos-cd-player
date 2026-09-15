@@ -1,8 +1,8 @@
 const albums = [
-  { title: 'Night Geometry', artist: 'The Meridian Lines', color: '#d88a31' },
-  { title: 'Glass Signals', artist: 'Low Arc', color: '#7f8d8d' },
-  { title: 'After the Last Train', artist: 'June Harbor', color: '#a44f39' },
-  { title: 'Soft Machines', artist: 'Static Gardens', color: '#576f9e' },
+  { id: 'night-geometry', title: 'Night Geometry', artist: 'The Meridian Lines' },
+  { id: 'glass-signals', title: 'Glass Signals', artist: 'Low Arc' },
+  { id: 'last-train', title: 'After the Last Train', artist: 'June Harbor' },
+  { id: 'soft-machines', title: 'Soft Machines', artist: 'Static Gardens' },
 ];
 
 export default function Home() {
@@ -48,13 +48,13 @@ export default function Home() {
               </div>
             </div>
             <div className="mt-6 grid grid-cols-2 gap-4">
-              {albums.map((album, index) => (
+              {albums.map((album) => (
                 <article key={album.title} className="group">
-                  <div className="aspect-square rounded-sm border border-white/10 p-4 shadow-lg transition-transform group-hover:-translate-y-1" style={{ background: `linear-gradient(145deg, ${album.color}, #171717 78%)` }}>
-                    <span className="font-mono text-[10px] tracking-[.18em] text-white/70">DISC {String(index + 1).padStart(2, '0')}</span>
-                    <div className="mt-8 h-px bg-white/35" />
-                    <p className="mt-3 max-w-28 font-heading text-xl leading-5 text-white">{album.title}</p>
-                  </div>
+                  <img
+                    src={`/covers/${album.id}.jpg`}
+                    alt={`${album.title} by ${album.artist} album artwork`}
+                    className="aspect-square w-full rounded-sm border border-white/10 object-cover shadow-lg transition-transform group-hover:-translate-y-1"
+                  />
                   <p className="mt-2 text-sm font-medium text-zinc-200">{album.title}</p>
                   <p className="text-xs text-zinc-500">{album.artist}</p>
                 </article>
@@ -63,8 +63,12 @@ export default function Home() {
           </div>
         </section>
 
-        <footer className="flex flex-col gap-2 border-t border-white/10 pt-6 text-sm text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
-          <p>For evaluation of the Not Streaming iOS app.</p>
+        <footer className="flex flex-col gap-3 border-t border-white/10 pt-6 text-sm text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-4">
+            <p>For evaluation of the Not Streaming iOS app.</p>
+            <a className="text-amber-300 underline decoration-amber-300/35 underline-offset-4 hover:text-amber-200" href="/support">Support</a>
+            <a className="text-amber-300 underline decoration-amber-300/35 underline-offset-4 hover:text-amber-200" href="/privacy">Privacy</a>
+          </div>
           <p className="font-mono text-xs text-zinc-600">SIMULATION · NO AUDIO IS TRANSMITTED</p>
         </footer>
       </div>

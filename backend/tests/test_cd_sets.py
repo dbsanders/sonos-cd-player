@@ -33,6 +33,37 @@ def test_save_survives_restart_and_does_not_change_playback(setup):
     assert changer.queue(speaker) == before
 
 
+def test_add_album_to_existing_or_new_set_does_not_change_playback(setup):
+    speaker, changer = setup
+    existing = saved_set(changer)
+    before = changer.queue(speaker)
+    speaker.events = []
+
+    updated = changer.add_album_to_set(existing['id'], 'New album', 'New artist')
+    created = changer.create_set_from_album('Solo pick', 'Another album', None)
+
+    assert updated['albums'][-1] == {'title': 'New album', 'artist': 'New artist'}
+    assert created['albums'] == [{'title': 'Another album', 'artist': None}]
+    assert changer.queue(speaker) == before
+    assert speaker.events == []
+    assert Changer(lambda: speaker, changer.path).list_sets()['sets'] == [updated, created]
+
+    with pytest.raises(HTTPException, match='already in'):
+        changer.add_album_to_set(existing['id'], 'new ALBUM', 'new ARTIST')
+
+
+def test_add_album_disk_failure_preserves_set(setup, monkeypatch):
+    _, changer = setup
+    existing = saved_set(changer)
+    before = [dict(album) for album in existing['albums']]
+    monkeypatch.setattr(changer, 'save_sets', lambda: (_ for _ in ()).throw(OSError('disk full')))
+
+    with pytest.raises(OSError, match='disk full'):
+        changer.add_album_to_set(existing['id'], 'New album', 'New artist')
+
+    assert existing['albums'] == before
+
+
 def test_selection_stops_clears_then_plays_in_saved_order_even_when_stale(setup):
     speaker, changer = setup
     cd_set = saved_set(changer)
@@ -114,9 +145,15 @@ def test_api(setup, monkeypatch):
     assert response.status_code == 200
     set_id = response.json()['id']
     assert client.get('/cd-sets').json()['sets'][0]['name'] == 'Road + Trip'
+    assert client.post(f'/cd-sets/{set_id}/albums', params={'title': 'B', 'artist': 'artist'}).status_code == 200
+    response = client.post('/cd-sets', params={'name': 'One CD', 'title': 'C', 'artist': 'artist'})
+    assert response.status_code == 200
+    assert response.json()['albums'] == [{'title': 'C', 'artist': 'artist'}]
+    single_set_id = response.json()['id']
     assert client.post(f'/cd-sets/{set_id}/play', params={'shuffle': True}).status_code == 200
     assert client.post('/discs/shuffle').status_code == 200
     assert client.delete(f'/cd-sets/{set_id}').status_code == 200
+    assert client.delete(f'/cd-sets/{single_set_id}').status_code == 200
     assert client.get('/cd-sets').json() == {'sets': []}
 
 

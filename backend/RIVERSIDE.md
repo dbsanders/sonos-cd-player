@@ -37,9 +37,10 @@ the requested music action with an error. If the Amp is already a follower of
 another room, the app asks you to make it the coordinator in Sonos rather than
 silently replacing its queue. Group the rooms by selecting the Amp first.
 
-The existing volume control adjusts the Amp only; adjust the Playbar's level in
-Sonos. TV behavior, including ungrouping on TV autoplay, remains controlled by the
-Playbar's Sonos settings. The server does not continuously force rooms together.
+The volume control adjusts the Amp's current Sonos group while preserving the
+relative balance between its members. When the Amp is not grouped, it adjusts the
+Amp alone. TV behavior, including ungrouping on TV autoplay, remains controlled by
+the Playbar's Sonos settings. The server does not continuously force rooms together.
 
 The default backend behavior without these variables remains Garage at
 192.168.1.85 with no automatic grouping.
@@ -61,9 +62,10 @@ Use the `music` sharing account in Sonos; no SMB password belongs in the contain
 Reserve both speaker IPs and the Pi's IP in the router.
 
 In the iPad app's Connection settings, set the backend to the Pi's IP on port 8000.
-The iPad interface still contains Garage labels and a Garage artwork URL fallback;
-those need a separate UI update for this installation. Actual backend control uses
-the configured Amp, irrespective of those labels.
+The app reads the room name from the backend's `/speaker` endpoint, so its connection
+and volume labels follow the configured Amp. Actual backend control likewise uses
+the configured Amp. Relative album-art paths returned by Sonos are resolved against
+that Amp as well, rather than an address belonging to another installation.
 
 Validation: backend unit tests cover grouping, unchanged Garage defaults, repeat
 play requests, and failure preserving queue/disc state. Physical S2 grouping and

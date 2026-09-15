@@ -22,7 +22,7 @@
 		<true/>
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Connect to your NAS to browse albums and control your Garage Sonos speaker.</string>
+	<string>Connect to your NAS to browse albums and control your Sonos speakers.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
