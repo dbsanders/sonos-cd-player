@@ -2,6 +2,10 @@
 
 Open SonosCDPlayer.xcodeproj. Select the SonosCDPlayer scheme, your signing team, and an iPhone or simulator, then Run.
 
+The same target supports Mac Catalyst on macOS 14 or newer. An Intel test build
+uses the generic Mac Catalyst destination with `ARCHS=x86_64`; it shares the
+same Connection setting as the iPhone and iPad versions.
+
 The app defaults to http://192.168.1.100:8000. Keep the device on the NAS's local network and allow Local Network access. See the repository root README for backend deployment, API details, and tests.
 
 If an iPad reports that the internet is offline, enable **Settings → Privacy & Security → Local Network → CD Player** and return to the app. The app needs local access to the NAS; internet access alone is insufficient. Open `http://192.168.1.100:8000/docs` in Safari on the iPad to check whether it can reach the backend. If that fails too, check the Wi-Fi network, VPN routing, NAS address, and backend service. Confirm the address in the app’s Connection settings.
@@ -13,6 +17,29 @@ API requests wait up to 30 seconds for connectivity, including the initial permi
 Regular-width iPad windows use a vintage hi-fi interface with jewel-case album browsing, flat dark panels, an amber status display, a scrollable numbered magazine, transport keys, and volume control. Full-width iPad portrait and landscape layouts place the collection and changer side by side. Narrow iPad windows and iPhones retain the compact tab interface.
 
 Implementation: `SonosCDPlayer/VintageChangerView.swift`. It shares the existing Player network model; no backend deployment is required.
+
+## Listening areas
+
+The iPhone Now Playing screen scrolls and uses a compact navigation title and
+disc image to keep the volume control reachable above the tab bar, including
+when room selection is visible or larger text needs more space. Rebuild and
+install the iOS app to receive this layout fix.
+
+With the updated Riverside backend, **Listen in** above the playback controls
+offers **Downstairs**, **Upstairs**, and **Both** on iPad and iPhone. Changing rooms
+stops music and preserves loaded CDs; press Play to restart the selected CD.
+Volume and the room label follow the selected area. The choice is saved on the
+backend and shared by every device. The control shows progress during a switch
+and refreshes the actual selection if a request fails or times out.
+
+Both layouts use a shared UIKit volume slider that releases the volume-editing
+lock when a touch ends or is cancelled. This prevents listening-area selection
+and background refresh from remaining disabled after adjusting volume. Install
+a rebuilt iOS app to receive this fix; no backend update is needed.
+
+Older backends, single-area installations, and demo mode hide the selector and
+retain the existing controls. Riverside's backend address is
+`http://192.168.2.100:8000`; existing saved app addresses are preserved.
 
 ## CD Sets
 

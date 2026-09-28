@@ -6,6 +6,7 @@ nas_host=${1:-nasadmin@192.168.1.100}
 stage_dir=$(mktemp -d)
 trap 'rm -rf "$stage_dir"' EXIT HUP INT TERM
 cp "$repo_dir/backend/app.py" "$repo_dir/backend/changer.py" "$repo_dir/backend/Dockerfile" "$repo_dir/backend/requirements.txt" "$stage_dir/"
+cp "$repo_dir/backend/home.env.example" "$stage_dir/"
 cp "$repo_dir/scripts/restart-container.sh" "$stage_dir/deploy-changer.sh"
 # Preserve the existing deployment directory and /data bind mount.
 COPYFILE_DISABLE=1 tar --no-xattrs -C "$stage_dir" -cf - . | ssh "$nas_host" 'cd /volume1/homes/nasadmin/sonos-cd-player && tar -xf -'

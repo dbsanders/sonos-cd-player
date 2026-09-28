@@ -11,7 +11,7 @@ An iPhone virtual CD changer for the Garage Sonos S1 speaker. A SwiftUI app talk
 ## Current setup
 
 - NAS/backend: `http://192.168.1.100:8000`
-- Speaker: Garage at `192.168.1.85`
+- Home testing: Downstairs = Living Room at `192.168.1.151`; Upstairs = Office at `192.168.1.158`; Both = Living Room and Office.
 - API documentation: `http://192.168.1.100:8000/docs`
 - NAS deployment directory: `/volume1/homes/nasadmin/sonos-cd-player`
 
@@ -21,17 +21,24 @@ The app and backend operate on the local network. No credentials belong in this 
 
 Open `ios/SonosCDPlayer/SonosCDPlayer.xcodeproj` in Xcode. Choose the SonosCDPlayer scheme and your iPhone or a simulator, then Run. Existing signing configuration is preserved; other developers must select their own signing team. Allow Local Network access on the phone. The server address can be changed in the app's Connection settings.
 
-The library shows all 587 currently indexed albums. The app supports loading albums, playing/ejecting discs, next/previous disc, pause/resume, volume, and status refresh.
+The library shows all currently indexed albums. It refreshes when the app opens,
+when manually requested, and automatically after its last successful library
+refresh becomes 24 hours old. The app supports loading albums, playing/ejecting
+discs, next/previous disc, pause/resume, volume, and status refresh.
 
 ## CD Sets
 
 On iPad, switch between **CD Library** and **CD Sets** above the collection. Select an album to reveal **Play now** and **Add to CD Set**; adding can append the album to an existing set or create a new single-album set without changing playback. Select a saved set’s artwork card to reveal **Play now** and **Delete this set**, or drag the set to the player to replace the magazine and begin playback. Choose **Save CD Set** on the player to create a new set or select an existing set to overwrite with the currently loaded albums, without interrupting playback. New names must be unique (ignoring case), with 1–80 characters. The iPhone Disc tray retains set playback and deletion in its playback options menu.
 
-Selecting a saved set immediately stops playback and clears the entire Sonos queue, including tracks added outside this app. The backend then resolves and loads the saved albums and starts the first track. **Shuffle CDs when loading** randomizes album order for each selection. **Shuffle Loaded CDs & Play** replaces the current queue with the loaded CDs in random order and restarts playback. Both keep tracks in their library order within each CD and set Sonos playback mode to Normal (track shuffle and repeat off). Shuffling does not change the saved set.
+Selecting a saved set immediately stops playback and clears the entire Sonos queue, including tracks added outside this app. The backend then resolves and loads the saved albums and starts the first track. **Shuffle CDs when loading** randomizes album order for each selection. **Shuffle Loaded CDs & Play** replaces the current queue with the loaded CDs in random order and restarts playback. Both keep tracks in their library order within each CD and set Sonos playback mode to Repeat All, so the magazine returns to its first track after the final disc. Shuffling does not change the saved set.
 
 Sets are stored in `/data/cd-sets.json` beside `/data/changer.json`, using album titles and artists rather than queue positions. Both survive backend deployments through the existing data mount. In local development, the sets file is placed beside the configured `CHANGER_STATE` file. Deleting a saved set leaves playback unchanged.
 
-If a load fails after the queue has been cleared, playback is not started and disc tracking is marked incomplete. Choose a set again to replace the partial queue, or reset disc tracking to retain it. Missing albums are not silently skipped or replaced by similarly named albums. Set loading can take longer for large collections; the app allows up to five minutes. If a request times out, refresh to check the result before retrying.
+All albums in a set are checked before the Sonos queue is changed. If an album's artist tag changed, a single exact title match updates the saved set automatically; duplicate exact titles remain an error so the app never guesses. A later device or network failure can still leave a partial queue, in which case playback is not started and disc tracking is marked incomplete. Choose a set again to replace the partial queue, or reset disc tracking to retain it. Set loading can take longer for large collections; the app allows up to five minutes. If a request times out, refresh to check the result before retrying.
+
+Album tracks are queued through Sonos in batches of up to 16 while preserving
+album order and disc boundaries. The completed queue is read back and verified
+before playback starts.
 
 This feature requires both the updated NAS backend (`./scripts/deploy-backend.sh`) and a rebuilt iOS app. Older backends continue to support the existing controls, with CD Sets disabled.
 
@@ -62,6 +69,17 @@ This uploads the backend from this checkout using SSH, then requests sudo in you
 
 The restart script builds before stopping the current service, retains the previous container, and rolls back on a failed readiness check. It reuses the existing `data` directory, mounted at `/data`, so disc assignments survive redeployments. Runtime queue state and Docker inspection backups are excluded from Git. Building/pushing Git commits alone does not deploy anything.
 
+The NAS deployment seeds `home.env` from `backend/home.env.example` on its first
+updated deployment and preserves that file thereafter. It enables the app's
+Upstairs / Downstairs / Both selector using Living Room and Office. Home testing
+uses `/data/home-changer.json` for separate disc tracking, leaving the previous
+Garage tracking in `/data/changer.json` intact. Saved CD Sets remain shared in
+`/data/cd-sets.json`. The initial selection is Downstairs; deployment does not
+start playback. Rebuild the iOS app from this checkout to get the selector.
+Switching areas stops playback and preserves loaded CDs, replacing the destination
+speaker's queue when changing leaders. Press Play after choosing an area.
+The Riverside Pi configuration is separate and unchanged.
+
 Verify deployment using `/discs`, `/status`, and `/albums`. The container uses host networking to reach Sonos. Keep the NAS's music share and Sonos music-library setup unchanged.
 
 ## API overview
@@ -80,12 +98,14 @@ Verify deployment using `/discs`, `/status`, and `/albums`. The container uses h
 | POST | `/tracks/next` or `/tracks/previous` | Native Sonos next/previous track |
 | GET | `/status` | Track, transport, queue size, volume, mute state |
 | GET / POST | `/volume` | Read group volume; set using `?level=0` through `100` |
+| GET / PUT | `/listening-area` | Read choices; select with JSON `{"area":"upstairs"}`, `downstairs`, or `both`. A change preserves CDs and stops playback. Requires upstairs configuration; see `backend/RIVERSIDE.md`. |
 | POST | `/discs/resync` | Forget disc assignments after external queue edits, keeping tracks |
 | GET / POST | `/cd-sets` | List saved sets; save current loaded CDs using `?name=...` |
 | POST | `/cd-sets?name=...&title=...&artist=...` | Create a set containing one selected library album |
 | POST | `/cd-sets/{id}/albums?title=...&artist=...` | Append a selected library album without changing playback |
 | DELETE | `/cd-sets/{id}` | Delete a saved set without changing playback |
 | PUT | `/cd-sets/{id}` | Overwrite a saved set with the currently loaded CDs, preserving its name |
+| POST | `/cd-sets/{id}/refresh` | Refresh saved album artists from Sonos without changing playback |
 | POST | `/cd-sets/{id}/play` | Stop, clear, load, and play a set; optional `?shuffle=true` |
 | POST | `/discs/shuffle` | Stop, clear, shuffle loaded CDs, and play from the beginning |
 

@@ -15,10 +15,13 @@ fi
 backup="sonos-cd-player-before-changer-$(date +%Y%m%d-%H%M%S)"
 docker inspect sonos-cd-player > "${backup}.json"
 docker build -t sonos-cd-player:changer .
+if [ ! -f home.env ]; then
+  cp home.env.example home.env
+fi
 mkdir -p data
 docker stop sonos-cd-player
 docker rename sonos-cd-player "$backup"
-if ! docker run -d --name sonos-cd-player --network host --restart unless-stopped -v "$PWD/data:/data" sonos-cd-player:changer; then
+if ! docker run -d --name sonos-cd-player --network host --restart unless-stopped --env-file home.env -v "$PWD/data:/data" sonos-cd-player:changer; then
   docker rename "$backup" sonos-cd-player
   docker start sonos-cd-player
   exit 1

@@ -41,6 +41,14 @@ struct LibrarySortSelector: View {
 
 struct AlbumList: Decodable { let albums: [Album] }
 struct SpeakerInfo: Decodable { let name: String }
+struct ListeningArea: Decodable, Identifiable {
+    let id: String
+    let name: String
+}
+struct ListeningAreaResponse: Decodable {
+    let area: String
+    let areas: [ListeningArea]
+}
 struct Disc: Decodable, Identifiable {
     let id: String
     let album: String
@@ -75,6 +83,8 @@ struct CDSetList: Decodable { let sets: [CDSet] }
 
 @MainActor @Observable final class Player {
     static let demoAddress = "https://not-streaming-demo.dbsand.chatgpt.site"
+    private static let libraryRefreshInterval: TimeInterval = 24 * 60 * 60
+    private static let lastLibraryRefreshKey = "lastLibraryRefresh"
     var albums: [Album] = []
     var discs: [Disc] = []
     var currentDisc: String?
@@ -90,16 +100,26 @@ struct CDSetList: Decodable { let sets: [CDSet] }
     var setsAvailable = false
     var setOperation: String?
     var speakerName: String?
+    var listeningArea: String?
+    var listeningAreas: [ListeningArea] = []
+    var changingArea = false
     var demoMode = (UserDefaults.standard.object(forKey: "demoMode") as? Bool) ?? true
     var address = UserDefaults.standard.string(forKey: "server") ?? "http://192.168.1.100:8000"
     var activeAddress: String { demoMode ? Self.demoAddress : address }
     var speakerDisplayName: String {
         if demoMode { return "Demo" }
+        if listeningAreas.count > 1,
+           let area = listeningAreas.first(where: { $0.id == listeningArea }) { return area.name }
         let trimmed = speakerName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return trimmed.isEmpty ? "Sonos" : trimmed
     }
     private var libraryLoaded = false
     private var artworkPrefetchTask: Task<Void, Never>?
+    private var libraryRefreshDue: Bool {
+        let lastRefresh = UserDefaults.standard.double(forKey: Self.lastLibraryRefreshKey)
+        let now = Date().timeIntervalSince1970
+        return lastRefresh == 0 || now < lastRefresh || now - lastRefresh >= Self.libraryRefreshInterval
+    }
     private let session: URLSession = {
         let configuration = URLSessionConfiguration.default
         // Give the first Local Network permission prompt time to complete.
@@ -128,7 +148,7 @@ struct CDSetList: Decodable { let sets: [CDSet] }
         }
     }
 
-    func request(_ path: String, method: String = "GET", query: [URLQueryItem] = [], longRunning: Bool = false) async throws -> Data {
+    func request(_ path: String, method: String = "GET", query: [URLQueryItem] = [], longRunning: Bool = false, body: Data? = nil) async throws -> Data {
         guard var url = URLComponents(string: activeAddress), ["http", "https"].contains(url.scheme ?? ""), url.host != nil else {
             throw APIError(message: "Enter a server address such as http://192.168.1.100:8000")
         }
@@ -140,6 +160,10 @@ struct CDSetList: Decodable { let sets: [CDSet] }
         guard let endpoint = url.url else { throw APIError(message: "Invalid server address") }
         var req = URLRequest(url: endpoint)
         req.httpMethod = method
+        if let body {
+            req.httpBody = body
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
         req.timeoutInterval = longRunning ? 300 : 15
         let data: Data
         let response: URLResponse
@@ -172,14 +196,18 @@ struct CDSetList: Decodable { let sets: [CDSet] }
         busy = true
         defer { busy = false }
         do {
-            if !demoMode && (library || speakerName == nil) {
+            let reloadLibrary = library || !libraryLoaded || libraryRefreshDue
+            try await refreshListeningArea()
+            if !demoMode && (reloadLibrary || speakerName == nil) {
                 await refreshSpeakerInfo()
             }
             try await refreshSets()
-            if library || !libraryLoaded {
+            if reloadLibrary {
                 let data = try await request("/albums")
                 albums = try JSONDecoder().decode(AlbumList.self, from: data).albums
                 libraryLoaded = true
+                UserDefaults.standard.set(Date().timeIntervalSince1970,
+                                          forKey: Self.lastLibraryRefreshKey)
                 prefetchArtwork()
             }
             try await refreshPlayback()
@@ -193,6 +221,41 @@ struct CDSetList: Decodable { let sets: [CDSet] }
         guard let data = try? await request("/speaker"),
               let info = try? JSONDecoder().decode(SpeakerInfo.self, from: data) else { return }
         speakerName = info.name
+    }
+    private func refreshListeningArea() async throws {
+        if demoMode {
+            listeningArea = nil; listeningAreas = []
+            return
+        }
+        do {
+            let data = try await request("/listening-area")
+            let response = try JSONDecoder().decode(ListeningAreaResponse.self, from: data)
+            listeningArea = response.area
+            listeningAreas = response.areas
+        } catch let error as APIError where error.statusCode == 404 {
+            listeningArea = nil; listeningAreas = []
+        }
+    }
+    func selectListeningArea(_ area: String) async {
+        guard !busy, !editingVolume, !draggingAlbum, area != listeningArea else { return }
+        busy = true; changingArea = true
+        defer { busy = false; changingArea = false }
+        do {
+            let body = try JSONEncoder().encode(["area": area])
+            let data = try await request("/listening-area", method: "PUT", longRunning: true, body: body)
+            let response = try JSONDecoder().decode(ListeningAreaResponse.self, from: data)
+            listeningArea = response.area; listeningAreas = response.areas
+            await refreshSpeakerInfo()
+            try await refreshPlayback()
+            connected = true
+            notice = "\(speakerDisplayName) selected. Press Play to start music."
+        } catch {
+            self.error = error.localizedDescription
+            // A timeout can occur after the server has committed the switch.
+            try? await refreshListeningArea()
+            await refreshSpeakerInfo()
+            try? await refreshPlayback()
+        }
     }
     private func refreshSets() async throws {
         do {
@@ -447,18 +510,21 @@ struct ContentView: View {
                     .refreshable { await player.refresh() }
             }.tabItem { Label("Disc tray", systemImage: "opticaldisc") }
             NavigationStack {
-                VStack(spacing: 24) {
-                    Spacer()
-                    Image(systemName: "opticaldisc.fill").font(.system(size: 120)).foregroundStyle(.orange.gradient)
-                    VStack(spacing: 8) {
-                        Text(player.status?.track["title"].flatMap { $0.isEmpty ? nil : $0 } ?? "Nothing playing").font(.title.bold()).multilineTextAlignment(.center)
-                        Text(player.status?.track["artist"] ?? (player.demoMode ? "Demo player" : player.speakerDisplayName)).foregroundStyle(.secondary)
-                        Text(player.status?.track["album"] ?? "").font(.subheadline).foregroundStyle(.secondary)
-                    }
-                    Text(player.status?.transport["current_transport_state"]?.replacingOccurrences(of: "_", with: " ").capitalized ?? "Not connected").font(.caption.weight(.semibold)).foregroundStyle(.orange)
-                    PlaybackControls(player: player)
-                    Spacer()
-                }.padding(24).frame(maxWidth: .infinity).navigationTitle("Now playing").toolbar { connectionToolbar }
+                ScrollView {
+                    VStack(spacing: 20) {
+                        Image(systemName: "opticaldisc.fill").font(.system(size: 88)).foregroundStyle(.orange.gradient)
+                        VStack(spacing: 8) {
+                            Text(player.status?.track["title"].flatMap { $0.isEmpty ? nil : $0 } ?? "Nothing playing").font(.title.bold()).multilineTextAlignment(.center)
+                            Text(player.status?.track["artist"] ?? (player.demoMode ? "Demo player" : player.speakerDisplayName)).foregroundStyle(.secondary)
+                            Text(player.status?.track["album"] ?? "").font(.subheadline).foregroundStyle(.secondary)
+                        }
+                        Text(player.status?.transport["current_transport_state"]?.replacingOccurrences(of: "_", with: " ").capitalized ?? "Not connected").font(.caption.weight(.semibold)).foregroundStyle(.orange)
+                        PlaybackControls(player: player)
+                    }.padding(24).frame(maxWidth: .infinity)
+                }
+                .navigationTitle("Now playing")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar { connectionToolbar }
             }.tabItem { Label("Now playing", systemImage: "waveform") }
         }
     }
@@ -577,6 +643,30 @@ private struct HelpTaskCard: View {
     }
 }
 
+struct ListeningAreaSelector: View {
+    @Bindable var player: Player
+    var body: some View {
+        if !player.demoMode && player.listeningAreas.count > 1 {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Listen in").font(.subheadline).foregroundStyle(.secondary)
+                    if player.changingArea { ProgressView().controlSize(.small) }
+                }
+                Picker("Listening area", selection: Binding(
+                    get: { player.listeningArea ?? "downstairs" },
+                    set: { area in Task { await player.selectListeningArea(area) } }
+                )) {
+                    ForEach(player.listeningAreas) { area in Text(area.name).tag(area.id) }
+                }.pickerStyle(.segmented)
+                    .disabled(player.busy || player.editingVolume || player.draggingAlbum || player.staleQueue)
+                Text(player.changingArea ? "Changing speakers…" : "Changing rooms stops music. Press Play when ready.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
 struct PlaybackControls: View {
     @Bindable var player: Player
     @State private var volume = 0.0
@@ -588,6 +678,7 @@ struct PlaybackControls: View {
     }
     var body: some View {
         VStack(spacing: 28) {
+            ListeningAreaSelector(player: player)
             HStack(spacing: 40) {
                 Button { Task { await player.action("/discs/previous") } } label: {
                     Label("Previous disc", systemImage: "backward.end.fill")
@@ -613,7 +704,7 @@ struct PlaybackControls: View {
                 }
                 HStack {
                     Image(systemName: "speaker.fill").foregroundStyle(.secondary)
-                    Slider(value: $volume, in: 0...100, step: 1) { editing in
+                    VolumeSlider(value: $volume) { editing in
                         player.editingVolume = editing
                         if !editing {
                             let level = Int(volume)
@@ -681,6 +772,7 @@ struct SettingsView: View {
                             UserDefaults.standard.set(player.demoMode, forKey: "demoMode")
                             player.resetLibrary(); player.discs = []; player.status = nil; player.connected = false
                             player.speakerName = nil
+                            player.listeningArea = nil; player.listeningAreas = []
                             player.cdSets = []; player.setsAvailable = false
                             dismiss()
                             Task { await player.refresh(library: true) }

@@ -71,11 +71,15 @@ def test_selection_stops_clears_then_plays_in_saved_order_even_when_stale(setup)
     speaker.events = []
     result = changer.play_set(cd_set['id'])
     assert result['status'] == 'playing'
-    assert speaker.events[:3] == ['stop', 'clear', 'resolve']
+    assert speaker.events[:4] == ['resolve', 'resolve', 'resolve', 'resolve']
+    assert speaker.events[4:6] == ['stop', 'clear']
     assert speaker.events[-1] == 'play'
-    assert speaker.play_mode == 'NORMAL'
+    assert speaker.play_mode == 'REPEAT_ALL'
     assert speaker.position == 1
     assert changer.queue(speaker) == ['1989 [+digital booklet]0', '1989 [+digital booklet]1', 'Björk & Friends0', 'Björk & Friends1']
+    assert speaker.batch_calls[-1] == [
+        '1989 [+digital booklet]0', '1989 [+digital booklet]1',
+        'Björk & Friends0', 'Björk & Friends1']
     assert [(d['queue_start'], d['queue_end']) for d in result['discs']] == [(1, 2), (3, 4)]
     assert len(changer.listing()['discs']) == 2
 
@@ -89,7 +93,7 @@ def test_shuffle_changes_cd_order_only_and_keeps_saved_order(setup, monkeypatch)
     assert changer.list_sets()['sets'][0]['albums'][0]['title'] == '1989 [+digital booklet]'
     changer.shuffle_discs()
     assert changer.queue(speaker) == ['1989 [+digital booklet]0', '1989 [+digital booklet]1', 'Björk & Friends0', 'Björk & Friends1']
-    assert speaker.play_mode == 'NORMAL'
+    assert speaker.play_mode == 'REPEAT_ALL'
 
 
 def test_partial_load_blocks_stale_positions_across_restart_and_can_retry(setup):
@@ -113,10 +117,43 @@ def test_missing_album_does_not_load_a_fuzzy_match(setup):
     cd_set = saved_set(changer)
     speaker.get_albums = lambda **kwargs: [type('Album', (), {'title': 'Different album', 'creator': 'artist'})()]
     speaker.events = []
+    before = changer.queue(speaker)
     with pytest.raises(HTTPException, match='Album not found'):
         changer.play_set(cd_set['id'])
-    assert changer.queue(speaker) == []
+    assert changer.queue(speaker) == before
+    assert 'stop' not in speaker.events and 'clear' not in speaker.events
     assert 'play' not in speaker.events
+
+
+def test_refresh_set_updates_stale_artist_without_changing_playback(setup):
+    speaker, changer = setup
+    cd_set = changer.create_set_from_album('Classical', 'Handel\'s Greatest Hits',
+                                           ' (Compilations)')
+    speaker.get_albums = lambda **kwargs: [
+        type('Album', (), {'title': "Handel's Greatest Hits", 'creator': 'Handel'})()]
+    before = changer.queue(speaker)
+    speaker.events = []
+
+    updated = changer.refresh_set(cd_set['id'])
+
+    assert updated['albums'] == [{'title': "Handel's Greatest Hits", 'artist': 'Handel'}]
+    assert changer.queue(speaker) == before
+    assert speaker.events == []
+    assert Changer(lambda: speaker, changer.path).list_sets()['sets'] == [updated]
+
+
+def test_refresh_set_rejects_ambiguous_title_and_preserves_saved_set(setup):
+    speaker, changer = setup
+    cd_set = changer.create_set_from_album('Hits', 'Greatest Hits', ' (Compilations)')
+    speaker.get_albums = lambda **kwargs: [
+        type('Album', (), {'title': 'Greatest Hits', 'creator': artist})()
+        for artist in ('Artist One', 'Artist Two')]
+
+    with pytest.raises(HTTPException) as error:
+        changer.refresh_set(cd_set['id'])
+
+    assert error.value.status_code == 409
+    assert changer.list_sets()['sets'] == [cd_set]
 
 
 def test_validation_and_failed_save_leave_sets_unchanged(setup, monkeypatch):
@@ -146,6 +183,7 @@ def test_api(setup, monkeypatch):
     set_id = response.json()['id']
     assert client.get('/cd-sets').json()['sets'][0]['name'] == 'Road + Trip'
     assert client.post(f'/cd-sets/{set_id}/albums', params={'title': 'B', 'artist': 'artist'}).status_code == 200
+    assert client.post(f'/cd-sets/{set_id}/refresh').status_code == 200
     response = client.post('/cd-sets', params={'name': 'One CD', 'title': 'C', 'artist': 'artist'})
     assert response.status_code == 200
     assert response.json()['albums'] == [{'title': 'C', 'artist': 'artist'}]

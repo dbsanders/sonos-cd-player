@@ -1,15 +1,30 @@
 import os
-from typing import Optional
+from functools import wraps
+from typing import Literal, Optional
 from urllib.parse import urljoin
 
 from fastapi import FastAPI, HTTPException, Query
 import soco
+from pydantic import BaseModel
 from requests.exceptions import RequestException
 
 app = FastAPI(title="Sonos CD Player")
 
 
+def serialized(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with changer.lock:
+            return function(*args, **kwargs)
+    return wrapped
+
+
 def get_speaker():
+    if changer.listening_area == 'upstairs':
+        bedroom = os.environ.get('SONOS_UPSTAIRS_IP')
+        if not bedroom:
+            raise HTTPException(409, 'The saved Upstairs selection requires SONOS_UPSTAIRS_IP')
+        return soco.SoCo(bedroom)
     return soco.SoCo(os.environ.get("SONOS_SPEAKER_IP", "192.168.1.85"))
 
 
@@ -25,16 +40,32 @@ def album_art_url(speaker, uri):
     return urljoin(f"http://{speaker.ip_address}:1400/", uri)
 
 
-def prepare_playback(speaker):
+def configured_members():
+    return list(dict.fromkeys(ip.strip() for ip in
+        os.environ.get('SONOS_GROUP_MEMBERS', '').split(',') if ip.strip()))
+
+
+def prepare_playback(speaker, area=None):
     """Join configured rooms only for an explicit music playback request."""
-    members = list(dict.fromkeys(ip.strip() for ip in
-        os.environ.get("SONOS_GROUP_MEMBERS", "").split(",") if ip.strip()))
-    if not members:
+    area = area or changer.listening_area
+    bedroom = os.environ.get('SONOS_UPSTAIRS_IP')
+    members = [] if area == 'upstairs' else configured_members()
+    if area == 'both' and bedroom:
+        members = list(dict.fromkeys([*members, bedroom]))
+    if not members and not bedroom:
         return
     try:
         if not speaker.is_coordinator:
             raise HTTPException(409, "The configured main speaker must lead the Sonos group. "
                                 "In Sonos, ungroup it and select it first before adding other rooms.")
+        if bedroom:
+            managed = {os.environ.get('SONOS_SPEAKER_IP', '192.168.1.85'),
+                       bedroom, *configured_members()}
+            selected = {speaker.ip_address, *members}
+            for member in list(speaker.group.members):
+                if member.ip_address in managed - selected:
+                    member.unjoin()
+                    member.stop()
         for ip in members:
             if ip == speaker.ip_address:
                 continue
@@ -53,6 +84,7 @@ def root():
     return {"status": "ok"}
 
 @app.get("/speaker")
+@serialized
 def speaker_info():
     speaker = get_speaker()
 
@@ -89,16 +121,26 @@ def albums():
     items = library.get_albums(complete_result=True)
 
     result = []
+    by_album = {}
 
     for album in items:
-        result.append({
+        entry = {
             "title": album.title,
             "artist": getattr(album, "creator", None),
             "album_art_uri": album_art_url(speaker, getattr(album, "album_art_uri", None)),
             "uri": getattr(album, "resources", [None])[0].uri
                 if getattr(album, "resources", None)
                 else None,
-        })
+        }
+        # Sonos can return the same album multiple times with artwork pointing
+        # at different tracks. Repeated identities break SwiftUI's lazy grids.
+        key = (entry['uri'] or entry['title'], entry['artist'] or '')
+        if key in by_album:
+            if not by_album[key]['album_art_uri']:
+                by_album[key]['album_art_uri'] = entry['album_art_uri']
+            continue
+        by_album[key] = entry
+        result.append(entry)
 
     return {
         "count": len(result),
@@ -106,7 +148,49 @@ def albums():
     }
 
 from changer import Changer
-changer = Changer(get_speaker, prepare_playback=prepare_playback)
+changer = Changer(lambda: get_speaker(), prepare_playback=prepare_playback)
+
+
+class ListeningAreaRequest(BaseModel):
+    area: Literal['upstairs', 'downstairs', 'both']
+
+
+def listening_area_info():
+    areas = [{'id': 'downstairs', 'name': 'Downstairs', 'speakers': list(dict.fromkeys([
+        os.environ.get('SONOS_SPEAKER_IP', '192.168.1.85'), *configured_members()]))}]
+    bedroom = os.environ.get('SONOS_UPSTAIRS_IP')
+    if bedroom:
+        areas.append({'id': 'upstairs', 'name': 'Upstairs', 'speakers': [bedroom]})
+        areas.append({'id': 'both', 'name': 'Both', 'speakers': [*areas[0]['speakers'], bedroom]})
+    return {'area': changer.listening_area, 'areas': areas}
+
+
+@app.get('/listening-area')
+def listening_area():
+    with changer.lock:
+        return listening_area_info()
+
+
+@app.put('/listening-area')
+def set_listening_area(request: ListeningAreaRequest):
+    with changer.lock:
+        if request.area != 'downstairs' and not os.environ.get('SONOS_UPSTAIRS_IP'):
+            raise HTTPException(409, 'No upstairs speaker is configured')
+        if request.area != changer.listening_area:
+            ip = (os.environ['SONOS_UPSTAIRS_IP'] if request.area == 'upstairs'
+                  else os.environ.get('SONOS_SPEAKER_IP', '192.168.1.85'))
+            destination = soco.SoCo(ip)
+            try:
+                # Check selected rooms before stopping existing playback. Excluded
+                # standalone rooms need not be online.
+                for room in next(a['speakers'] for a in listening_area_info()['areas']
+                                 if a['id'] == request.area):
+                    soco.SoCo(room).get_current_transport_info()
+                changer.switch_area(request.area, destination,
+                                    lambda speaker: prepare_playback(speaker, request.area))
+            except (soco.exceptions.SoCoException, RequestException, OSError) as exc:
+                raise HTTPException(503, 'Selected speakers are unavailable. Check them and retry.') from exc
+        return listening_area_info()
 
 @app.post("/play-album")
 def play_album(title: str, artist: Optional[str] = None):
@@ -132,6 +216,11 @@ def save_cd_set(name: str, title: Optional[str] = None, artist: Optional[str] = 
 @app.put("/cd-sets/{set_id}")
 def overwrite_cd_set(set_id: str):
     return changer.overwrite_set(set_id)
+
+@app.post("/cd-sets/{set_id}/refresh")
+def refresh_cd_set(set_id: str):
+    """Refresh saved Sonos album artists without changing playback."""
+    return changer.refresh_set(set_id)
 
 @app.post("/cd-sets/{set_id}/albums")
 def add_album_to_cd_set(set_id: str, title: str, artist: Optional[str] = None):
@@ -177,6 +266,7 @@ def eject_disc(disc_id: str):
     return changer.eject(disc_id)
 
 @app.get("/status")
+@serialized
 def status():
     speaker = get_speaker()
     volume_target = get_volume_target(speaker)
@@ -209,8 +299,11 @@ def test_queue():
 @app.post("/play")
 def play():
     with changer.lock:
+        if changer.state.get('incomplete'):
+            raise HTTPException(409, 'A queue operation did not finish. Resync or reload a CD Set before playing.')
         speaker = get_speaker()
         prepare_playback(speaker)
+        speaker.play_mode = 'REPEAT_ALL'
         return {
             "before": speaker.get_current_transport_info(),
             "result": speaker.play(),
@@ -218,12 +311,14 @@ def play():
         }
 
 @app.post("/pause")
+@serialized
 def pause():
     speaker = get_speaker()
     speaker.pause()
     return {"transport": speaker.get_current_transport_info()}
 
 
+@serialized
 def skip_track(direction: str):
     speaker = get_speaker()
     try:
@@ -247,6 +342,7 @@ def previous_track():
 
 
 @app.get("/volume")
+@serialized
 def volume():
     speaker = get_speaker()
     volume_target = get_volume_target(speaker)
@@ -254,6 +350,7 @@ def volume():
 
 
 @app.post("/volume")
+@serialized
 def set_volume(level: int = Query(..., ge=0, le=100)):
     speaker = get_speaker()
     volume_target = get_volume_target(speaker)
@@ -262,6 +359,7 @@ def set_volume(level: int = Query(..., ge=0, le=100)):
 
 
 @app.get("/transport")
+@serialized
 def transport():
     speaker = get_speaker()
 

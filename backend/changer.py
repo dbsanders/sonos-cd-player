@@ -16,6 +16,7 @@ class Changer:
         self.path = Path(path or os.environ.get('CHANGER_STATE', '/data/changer.json'))
         self.lock = RLock()
         self.state = json.loads(self.path.read_text()) if self.path.exists() else {'discs': [], 'queue': None, 'uid': None}
+        self.listening_area = self.state.get('listening_area', 'downstairs')
         self.sets_path = self.path.with_name('cd-sets.json')
         self.sets = json.loads(self.sets_path.read_text()) if self.sets_path.exists() else []
 
@@ -125,8 +126,32 @@ class Changer:
 
     def play_set(self, set_id, shuffle=False):
         with self.lock:
-            cd_set = self.find_set(set_id)
+            cd_set = self.refresh_set(set_id)
             return self.replace_discs(cd_set['albums'], shuffle)
+
+    def refresh_set(self, set_id):
+        """Refresh saved album identities without changing playback or the queue."""
+        with self.lock:
+            existing = self.find_set(set_id)
+            speaker = self.get_speaker()
+            albums = []
+            for identity in existing['albums']:
+                album, _ = self.resolve(speaker, identity['title'], identity.get('artist'))
+                if album.title.casefold() != identity['title'].casefold():
+                    raise HTTPException(404, f"Album not found: {identity['title']}")
+                albums.append({'title': album.title,
+                               'artist': getattr(album, 'creator', None)})
+            if albums == existing['albums']:
+                return existing
+            replacement = {**existing, 'albums': albums}
+            index = self.sets.index(existing)
+            self.sets[index] = replacement
+            try:
+                self.save_sets()
+            except Exception:
+                self.sets[index] = existing
+                raise
+            return replacement
 
     def shuffle_discs(self):
         with self.lock:
@@ -144,6 +169,14 @@ class Changer:
             raise HTTPException(409, 'The configured main speaker must be its group coordinator to use the changer')
         if shuffle:
             random.shuffle(albums)
+        # Resolve every album before changing Sonos. A stale or ambiguous saved
+        # identity must leave the current queue and playback untouched.
+        resolved = []
+        for identity in albums:
+            album, tracks = self.resolve(speaker, identity['title'], identity.get('artist'))
+            if album.title.casefold() != identity['title'].casefold():
+                raise HTTPException(404, f"Album not found: {identity['title']}")
+            resolved.append((album, tracks))
         self.prepare_playback(speaker)
         # Persist before touching Sonos: a crash/partial failure must not leave
         # old magazine positions trusted, even if the resulting queue is empty.
@@ -152,20 +185,20 @@ class Changer:
         try:
             speaker.stop()
             speaker.clear_queue()
-            speaker.play_mode = 'NORMAL'
-            expected, discs = [], []
-            for identity in albums:
-                album, tracks = self.resolve(speaker, identity['title'], identity.get('artist'))
-                if album.title.casefold() != identity['title'].casefold():
-                    raise HTTPException(404, f"Album not found: {identity['title']}")
+            speaker.play_mode = 'REPEAT_ALL'
+            expected, discs, tracks_to_add = [], [], []
+            for album, tracks in resolved:
                 start = len(expected) + 1
                 for track in tracks:
-                    speaker.add_to_queue(track)
                     expected.append(track.resources[0].uri)
+                    tracks_to_add.append(track)
                 discs.append({'id': uuid4().hex, 'album': album.title,
                               'artist': getattr(album, 'creator', None),
                               'queue_start': start, 'queue_end': len(expected),
                               'tracks_added': len(tracks)})
+            # SoCo sends at most 16 tracks per Sonos request. This preserves
+            # order while avoiding one network round-trip for every track.
+            speaker.add_multiple_to_queue(tracks_to_add)
             if self.queue(speaker) != expected:
                 raise HTTPException(409, 'Sonos queue changed while loading the CDs')
             self.state = {'discs': discs, 'queue': expected, 'uid': speaker.uid}
@@ -179,10 +212,68 @@ class Changer:
         return {'status': 'playing', 'discs': discs}
 
     def save(self):
+        self.state['listening_area'] = self.listening_area
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix('.tmp')
         tmp.write_text(json.dumps(self.state))
         tmp.replace(self.path)
+
+    def switch_area(self, area, destination, configure_group):
+        """Move the magazine, with playback stopped; caller holds our lock.
+
+        Copy queue items including their Sonos metadata, preserving disc IDs and
+        positions. Mark uncertainty on disk before any device mutations.
+        """
+        if area == self.listening_area:
+            return
+        source, expected = self.check()
+        items = []
+        while len(items) < len(expected):
+            page = source.get_queue(start=len(items), max_items=100)
+            if not page:
+                raise HTTPException(502, 'Incomplete queue while changing listening area')
+            items.extend(page)
+        if [t.resources[0].uri for t in items] != expected:
+            raise HTTPException(409, 'Queue changed while changing listening area')
+        current = self.current(source)
+        disc = next((d for d in self.state['discs'] if d['id'] == current), None)
+        index = disc['queue_start'] - 1 if disc else 0
+        previous = dict(self.state)
+        previous_area = self.listening_area
+        self.state['incomplete'] = True
+        self.save()
+        try:
+            source.stop()
+            if destination.uid != source.uid:
+                if not destination.is_coordinator:
+                    destination.unjoin()
+                destination.stop()
+                destination.clear_queue()
+                for item in items:
+                    destination.add_to_queue(item)
+            configure_group(destination)
+            if self.queue(destination) != expected:
+                raise HTTPException(409, 'Destination queue did not match the loaded CDs')
+            destination.play_mode = 'REPEAT_ALL'
+            if items:
+                destination.play_from_queue(index, start=False)
+            self.listening_area = area
+            self.state = {**previous, 'uid': destination.uid, 'incomplete': False}
+            self.save()
+        except Exception as exc:
+            # The original queue usually survives a failed copy. Only trust it
+            # after checking; topology operations cannot be rolled back atomically.
+            self.listening_area = previous_area
+            self.state = {**previous, 'incomplete': True}
+            try:
+                if source.is_coordinator and self.queue(source) == expected:
+                    self.state = previous
+            except Exception:
+                pass
+            self.save()
+            raise HTTPException(503, 'Could not change listening area. Playback may be stopped; '
+                                'check the speakers and retry. If disc tracking is incomplete, '
+                                'restore the original group leader and resync or reload a CD Set.') from exc
 
     def queue(self, speaker):
         result = []
@@ -211,9 +302,18 @@ class Changer:
     def resolve(self, speaker, title, artist=None):
         albums = list(speaker.music_library.get_albums(search_term=title, complete_result=True))
         if artist:
-            albums = [a for a in albums if (getattr(a, 'creator', '') or '').casefold() == artist.casefold()]
-        exact = [a for a in albums if a.title.casefold() == title.casefold()]
-        albums = exact or albums
+            exact = [a for a in albums if a.title.casefold() == title.casefold()]
+            exact_artist = [a for a in exact
+                            if (getattr(a, 'creator', '') or '').casefold() == artist.casefold()]
+            artist_matches = [a for a in albums
+                              if (getattr(a, 'creator', '') or '').casefold() == artist.casefold()]
+            # Tags can move an album out of Sonos's Compilations artist. When
+            # that happens, accept only one exact title; never guess between
+            # multiple albums that happen to share a title.
+            albums = exact_artist or artist_matches or exact
+        else:
+            exact = [a for a in albums if a.title.casefold() == title.casefold()]
+            albums = exact or albums
         if not albums:
             raise HTTPException(404, 'Album not found')
         if len(albums) > 1:
@@ -244,11 +344,11 @@ class Changer:
             expected = before + [t.resources[0].uri for t in tracks]
             # Check again after library browsing, before modifying the queue.
             self.check()
-            for track in tracks:
-                speaker.add_to_queue(track)
+            speaker.add_multiple_to_queue(tracks)
             actual = self.queue(speaker)
             if actual != expected:
                 raise HTTPException(409, 'Queue changed during loading; inspect the queue and resync disc mappings')
+            speaker.play_mode = 'REPEAT_ALL'
             disc = {'id': uuid4().hex, 'album': album.title, 'artist': getattr(album, 'creator', None), 'queue_start': len(before) + 1, 'queue_end': len(actual), 'tracks_added': len(tracks)}
             self.state['discs'].append(disc)
             self.state['queue'] = actual
@@ -268,6 +368,7 @@ class Changer:
             speaker, _ = self.check()
             disc = self.find(disc_id)
             self.prepare_playback(speaker)
+            speaker.play_mode = 'REPEAT_ALL'
             speaker.play_from_queue(disc['queue_start'] - 1)
             return {'status': 'playing', 'disc': disc, 'transport': speaker.get_current_transport_info()}
 

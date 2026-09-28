@@ -636,6 +636,7 @@ private struct VintageTransport: View {
     private var transport: String { player.status?.transport["current_transport_state"] ?? "" }
     var body: some View {
         VStack(spacing: 10) {
+            ListeningAreaSelector(player: player)
             HStack(spacing: 12) {
                 transportButton("Previous disc", icon: "backward.end.fill", path: "/discs/previous", disabled: player.discs.isEmpty || player.staleQueue)
                 transportButton(transport == "PLAYING" ? "Pause" : "Play", icon: transport == "PLAYING" ? "pause.fill" : "play.fill", path: transport == "PLAYING" ? "/pause" : "/play", disabled: !["PLAYING", "PAUSED_PLAYBACK", "STOPPED"].contains(transport) || (player.status?.track["uri"] ?? "").isEmpty)
@@ -657,7 +658,7 @@ private struct VintageTransport: View {
                         Spacer()
                         Text(player.status?.volume == nil ? "—" : "\(Int(volume))\(player.status?.muted == true ? " · MUTED" : "")").foregroundStyle(amber)
                     }.font(.system(size: 9, weight: .medium, design: .monospaced))
-                    Slider(value: $volume, in: 0...100, step: 1) { editing in
+                    VolumeSlider(value: $volume, tint: amber) { editing in
                         player.editingVolume = editing
                         if !editing {
                             let value = Int(volume)

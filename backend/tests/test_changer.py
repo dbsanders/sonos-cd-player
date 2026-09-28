@@ -18,9 +18,11 @@ class Speaker:
         self.position = 1
         self.music_library = self
         self.fail_add = False
+        self.batch_calls = []
         self.events = []
         self.play_mode = 'SHUFFLE'
     def stop(self): self.events.append('stop')
+    def play(self): self.events.append('resume')
     def clear_queue(self):
         self.events.append('clear')
         self.items = []
@@ -37,6 +39,11 @@ class Speaker:
         if self.fail_add and t.resources[0].uri.endswith('1'):
             raise RuntimeError('network failure')
         self.items.append(t)
+    def add_multiple_to_queue(self, items):
+        items = list(items)
+        self.batch_calls.append([item.resources[0].uri for item in items])
+        for item in items:
+            self.add_to_queue(item)
     def remove_from_queue(self, index):
         self.items.pop(index)
     def play_from_queue(self, index):
@@ -57,6 +64,7 @@ def setup(tmp_path):
 def test_lifecycle(setup):
     s,c = setup
     a=c.load('A')['disc']; b=c.load('B')['disc']
+    assert s.play_mode == 'REPEAT_ALL'
     assert (a['queue_start'],a['queue_end']) == (2,3)
     assert (b['queue_start'],b['queue_end']) == (4,5)
     assert s.items[0].resources[0].uri == 'existing'
@@ -106,6 +114,7 @@ def test_http_endpoints(setup,monkeypatch):
     import app
     from fastapi.testclient import TestClient
     monkeypatch.setattr(app,'changer',c)
+    monkeypatch.setattr(app,'get_speaker',lambda:s)
     client=TestClient(app.app)
     a=client.post('/discs/load',params={'title':'A'}).json()['disc']
     assert client.get('/discs').status_code==200
@@ -114,6 +123,9 @@ def test_http_endpoints(setup,monkeypatch):
     assert client.post('/discs/previous').status_code==200
     assert client.delete('/discs/'+a['id']).status_code==200
     assert client.post('/play-album',params={'title':'B'}).json()['status']=='playing'
+    s.play_mode = 'NORMAL'
+    assert client.post('/play').status_code == 200
+    assert s.play_mode == 'REPEAT_ALL'
 
 
 def test_eject_all_clears_entire_queue_once_and_persists(setup, monkeypatch):
