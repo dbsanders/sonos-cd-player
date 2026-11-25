@@ -12,6 +12,12 @@ If an iPad reports that the internet is offline, enable **Settings → Privacy &
 
 API requests wait up to 30 seconds for connectivity, including the initial permission prompt. Background refresh retries an unsuccessful initial library load after connectivity returns.
 
+While the app is active, status refreshes run in the background every five seconds
+without dimming the buttons or flashing a progress indicator. Controls show busy
+state for manual refreshes and user actions. An action requested during a
+background refresh waits for that refresh to finish before sending its command.
+Rebuild and install the app to receive this fix; no backend update is needed.
+
 ## iPad interface
 
 Regular-width iPad windows use a vintage hi-fi interface with jewel-case album browsing, flat dark panels, an amber status display, a scrollable numbered magazine, transport keys, and volume control. Full-width iPad portrait and landscape layouts place the collection and changer side by side. Narrow iPad windows and iPhones retain the compact tab interface.

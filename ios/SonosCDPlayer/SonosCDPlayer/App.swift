@@ -114,6 +114,8 @@ struct CDSetList: Decodable { let sets: [CDSet] }
         return trimmed.isEmpty ? "Sonos" : trimmed
     }
     private var libraryLoaded = false
+    @ObservationIgnored private var refreshing = false
+    @ObservationIgnored private var refreshWaiters: [CheckedContinuation<Void, Never>] = []
     private var artworkPrefetchTask: Task<Void, Never>?
     private var libraryRefreshDue: Bool {
         let lastRefresh = UserDefaults.standard.double(forKey: Self.lastLibraryRefreshKey)
@@ -192,9 +194,17 @@ struct CDSetList: Decodable { let sets: [CDSet] }
         return data
     }
     func refresh(library: Bool = false, silent: Bool = false) async {
-        guard !busy && !editingVolume && !draggingAlbum else { return }
-        busy = true
-        defer { busy = false }
+        guard !busy && !refreshing && !editingVolume && !draggingAlbum else { return }
+        refreshing = true
+        // Routine polling must not dim controls or flash the progress indicator.
+        if !silent { busy = true }
+        defer {
+            refreshing = false
+            if !silent { busy = false }
+            let waiters = refreshWaiters
+            refreshWaiters.removeAll()
+            for waiter in waiters { waiter.resume() }
+        }
         do {
             let reloadLibrary = library || !libraryLoaded || libraryRefreshDue
             try await refreshListeningArea()
@@ -217,6 +227,15 @@ struct CDSetList: Decodable { let sets: [CDSet] }
             if !silent { self.error = error.localizedDescription }
         }
     }
+    private func beginOperation() async -> Bool {
+        guard !busy else { return false }
+        // Reserve the controls immediately, then finish any read before writing.
+        busy = true
+        if refreshing {
+            await withCheckedContinuation { refreshWaiters.append($0) }
+        }
+        return true
+    }
     private func refreshSpeakerInfo() async {
         guard let data = try? await request("/speaker"),
               let info = try? JSONDecoder().decode(SpeakerInfo.self, from: data) else { return }
@@ -237,8 +256,9 @@ struct CDSetList: Decodable { let sets: [CDSet] }
         }
     }
     func selectListeningArea(_ area: String) async {
-        guard !busy, !editingVolume, !draggingAlbum, area != listeningArea else { return }
-        busy = true; changingArea = true
+        guard !editingVolume, !draggingAlbum, area != listeningArea,
+              await beginOperation() else { return }
+        changingArea = true
         defer { busy = false; changingArea = false }
         do {
             let body = try JSONEncoder().encode(["area": area])
@@ -269,8 +289,7 @@ struct CDSetList: Decodable { let sets: [CDSet] }
         }
     }
     func saveSet(name: String, replacing setID: String? = nil) async -> Bool {
-        guard !busy else { return false }
-        busy = true
+        guard await beginOperation() else { return false }
         defer { busy = false }
         do {
             if let setID {
@@ -284,8 +303,7 @@ struct CDSetList: Decodable { let sets: [CDSet] }
         } catch { self.error = error.localizedDescription; return false }
     }
     func addAlbum(_ album: Album, to cdSet: CDSet?, newSetName: String = "") async -> Bool {
-        guard !busy else { return false }
-        busy = true
+        guard await beginOperation() else { return false }
         defer { busy = false }
         let albumQuery = [
             URLQueryItem(name: "title", value: album.title),
@@ -306,8 +324,7 @@ struct CDSetList: Decodable { let sets: [CDSet] }
         } catch { self.error = error.localizedDescription; return false }
     }
     func deleteSet(_ cdSet: CDSet) async {
-        guard !busy else { return }
-        busy = true
+        guard await beginOperation() else { return }
         defer { busy = false }
         do {
             _ = try await request("/cd-sets/\(cdSet.id)", method: "DELETE")
@@ -321,8 +338,7 @@ struct CDSetList: Decodable { let sets: [CDSet] }
         await replaceCDs(path: "/discs/shuffle", label: "Shuffling CDs…")
     }
     private func replaceCDs(path: String, query: [URLQueryItem] = [], label: String) async {
-        guard !busy && !draggingAlbum else { return }
-        busy = true
+        guard !draggingAlbum, await beginOperation() else { return }
         setOperation = label
         discs = []; currentDisc = nil; status = nil
         defer { busy = false; setOperation = nil }
@@ -348,9 +364,11 @@ struct CDSetList: Decodable { let sets: [CDSet] }
     }
     @discardableResult
     func action(_ path: String, method: String = "POST", query: [URLQueryItem] = [], success: String? = nil) async -> Bool {
-        guard !busy else { return false }
-        busy = true
+        guard await beginOperation() else { return false }
         defer { busy = false }
+        return await performAction(path, method: method, query: query, success: success)
+    }
+    private func performAction(_ path: String, method: String = "POST", query: [URLQueryItem] = [], success: String? = nil) async -> Bool {
         do {
             _ = try await request(path, method: method, query: query)
             notice = success
@@ -365,13 +383,15 @@ struct CDSetList: Decodable { let sets: [CDSet] }
     }
     @discardableResult
     func load(_ album: Album, play: Bool = false) async -> Bool {
+        guard await beginOperation() else { return false }
+        defer { busy = false }
         guard !staleQueue else { return false }
         if let disc = loadedDisc(for: album) {
-            return play ? await action("/discs/\(disc.id)/play", success: "Playing \(album.title)") : false
+            return play ? await performAction("/discs/\(disc.id)/play", success: "Playing \(album.title)") : false
         }
         var query = [URLQueryItem(name: "title", value: album.title)]
         if let artist = album.artist, !artist.isEmpty { query.append(URLQueryItem(name: "artist", value: artist)) }
-        return await action(play ? "/play-album" : "/discs/load", query: query, success: "\(play ? "Playing" : "Loaded") \(album.title)")
+        return await performAction(play ? "/play-album" : "/discs/load", query: query, success: "\(play ? "Playing" : "Loaded") \(album.title)")
     }
 }
 
